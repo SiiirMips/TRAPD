@@ -1,0 +1,23 @@
+﻿# Standard ignores
+.DS_Store
+node_modules/
+target/ # Rust build artifacts
+__pycache__/
+*.pyc
+venv/ # Python virtual environments
+
+# Next.js
+.next/
+out/
+
+# Supabase (if local setup)
+.supabase/
+supabase/migrations/*.sql # If you generate them locally and don't want to track all
+
+# Logs
+*.log
+logs/
+
+# OS generated files
+.vscode/
+.idea/
