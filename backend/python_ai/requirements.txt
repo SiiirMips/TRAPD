@@ -1,5 +1,5 @@
 fastapi==0.111.0
 uvicorn==0.30.1
-pydantic==1.10.16 # HIER GEÄNDERT auf Pydantic v1
+pydantic==1.10.16 # WICHTIG: Pydantic 1.x für Kompatibilität
 python-dotenv==1.0.1
-supabase==2.4.1 # KORRIGIERT: Der korrekte Paketname und eine aktuelle Version
+supabase==2.4.1

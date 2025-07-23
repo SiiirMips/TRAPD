@@ -4,22 +4,21 @@ import uvicorn
 import os
 from dotenv import load_dotenv
 
+# Lade Umgebungsvariablen (DIES MUSS ALS ALLERERSTES GESCHEHEN!)
+load_dotenv()
+
 # Importiere deine Router
 from api.routes.honeypot_routes import router as honeypot_router
-from api.routes.usb_drop_routes import router as usb_drop_router
-
-# Lade Umgebungsvariablen
-load_dotenv()
+# from api.routes.usb_drop_routes import router as usb_drop_router # ENTFERNT: USB-Router
 
 app = FastAPI(
     title="YourProjectName AI Backend API",
-    description="Central API for honeypot data processing and USB drop beacon reception.",
+    description="Central API for honeypot data processing.",
     version="0.1.0"
 )
 
 # Füge die Router zur Hauptanwendung hinzu
-app.include_router(honeypot_router, prefix="/analyze") # Beispiel-Prefix für Honeypot-Analysen
-app.include_router(usb_drop_router, prefix="/usb")     # Beispiel-Prefix für USB-Drop
+app.include_router(honeypot_router, prefix="/analyze") # DIESE ZEILE MUSS AKTIV SEIN
 
 @app.get("/")
 async def read_root():

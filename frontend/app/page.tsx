@@ -1,103 +1,139 @@
-import Image from "next/image";
+// frontend/nextjs_dashboard/app/page.tsx
+import { supabase } from '../supabaseClient'; // Importiere den Supabase Client
+import { format } from 'date-fns'; // Für bessere Datumsformatierung
 
-export default function Home() {
+// Definiere ein Interface für die Struktur der Log-Einträge
+interface AttackerLog {
+  id: string;
+  timestamp: string;
+  source_ip: string;
+  honeypot_type: string;
+  interaction_data: any; // JSONB-Feld
+  status: string;
+}
+
+// Dies ist eine Server Component in Next.js App Router.
+// Datenabruf kann direkt hier erfolgen.
+export default async function HomePage() {
+  let logs: AttackerLog[] = [];
+  let error: string | null = null;
+
+  try {
+    // Daten aus der 'attacker_logs' Tabelle abrufen
+    // Sortiere nach Zeitstempel absteigend (neueste zuerst)
+    // Begrenze auf die letzten 50 Einträge für die Übersicht
+    const { data, error: fetchError } = await supabase
+      .from('attacker_logs')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .limit(50);
+
+    if (fetchError) {
+      error = fetchError.message;
+      console.error('Fehler beim Abrufen der Logs:', fetchError);
+    } else {
+      logs = data || [];
+    }
+  } catch (e: any) {
+    error = e.message;
+    console.error('Unerwarteter Fehler beim Supabase-Abruf:', e);
+  }
+
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-100 p-4 sm:p-6 lg:p-8">
+      <div className="max-w-7xl mx-auto bg-white shadow-xl rounded-2xl overflow-hidden p-6 lg:p-10">
+        <h1 className="text-4xl sm:text-5xl font-extrabold text-center text-gray-800 mb-8 tracking-tight">
+          Honeypot Dashboard
+        </h1>
+        <p className="text-center text-gray-600 text-lg mb-10 max-w-2xl mx-auto">
+          Übersicht der erfassten Angreiferinteraktionen und Honeypot-Aktivitäten.
+        </p>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        {error && (
+          <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg mb-6" role="alert">
+            <p className="font-bold">Fehler beim Laden der Daten:</p>
+            <p>{error}</p>
+          </div>
+        )}
+
+        {logs.length === 0 && !error && (
+          <div className="bg-blue-50 border-l-4 border-blue-500 text-blue-700 p-4 rounded-lg mb-6">
+            <p className="font-bold">Keine Logs gefunden</p>
+            <p>Noch keine Angreifer-Logs vorhanden. Starten Sie Ihre Honeypots, um Daten zu erfassen!</p>
+          </div>
+        )}
+
+        {logs.length > 0 && (
+          <div className="shadow-lg rounded-xl overflow-hidden border border-gray-200">
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-100">
+                  <tr>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      Timestamp
+                    </th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      IP-Adresse
+                    </th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      Honeypot Typ
+                    </th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      Interaktions-Details
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-100">
+                  {logs.map((log) => (
+                    <tr key={log.id} className="hover:bg-gray-50 transition-colors duration-150 ease-in-out">
+                      <td className="px-4 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm text-gray-800">
+                        {format(new Date(log.timestamp), 'dd.MM.yyyy HH:mm:ss')}
+                      </td>
+                      <td className="px-4 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm text-gray-800">
+                        {log.source_ip}
+                      </td>
+                      <td className="px-4 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm text-gray-800">
+                        <span className={`px-2.5 py-0.5 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                          log.honeypot_type === 'http' ? 'bg-indigo-100 text-indigo-800' :
+                          log.honeypot_type === 'ssh' ? 'bg-teal-100 text-teal-800' :
+                          'bg-gray-200 text-gray-800'
+                        }`}>
+                          {log.honeypot_type.toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 sm:px-6 sm:py-4 text-sm text-gray-600 max-w-sm truncate">
+                        {/* Zeigt die wichtigsten Details an */}
+                        {log.interaction_data?.request_path && (
+                          <p className="mb-1">Pfad: <span className="font-medium text-gray-800">{log.interaction_data.request_path}</span></p>
+                        )}
+                        {log.interaction_data?.username_attempt && (
+                          <p className="mb-1">Login: <span className="font-medium text-gray-800">{log.interaction_data.username_attempt}</span></p>
+                        )}
+                        {log.interaction_data?.command_executed && (
+                          <p className="mb-1">Befehl: <span className="font-medium text-gray-800">{log.interaction_data.command_executed}</span></p>
+                        )}
+                        {log.interaction_data?.method && !log.interaction_data?.request_path && (
+                          <p className="mb-1">Methode: <span className="font-medium text-gray-800">{log.interaction_data.method}</span></p>
+                        )}
+                        {/* Fallback für andere JSONB-Daten, wenn keine spezifischen Felder gefunden wurden */}
+                        {!log.interaction_data?.request_path &&
+                         !log.interaction_data?.username_attempt &&
+                         !log.interaction_data?.command_executed &&
+                         !log.interaction_data?.method &&
+                         JSON.stringify(log.interaction_data).length > 2 ? (
+                          <p className="text-xs text-gray-500 italic">
+                            {JSON.stringify(log.interaction_data).substring(0, 70)}...
+                          </p>
+                        ) : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

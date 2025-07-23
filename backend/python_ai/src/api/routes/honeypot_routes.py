@@ -1,27 +1,21 @@
 # backend/python_ai/src/api/routes/honeypot_routes.py
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field # Pydantic v1.x importiert BaseModel direkt
 from datetime import datetime
 from typing import Dict, Any, Optional
-
-# WICHTIG: Supabase Client Initialisierung - Nur hier, wenn dieser Router der einzige ist, der Supabase nutzt
-# Oder über ein globales App-State-Objekt in main.py übergeben (komplexer für MVP)
-# Fürs MVP ist es einfacher, den Client hier zu initialisieren.
-# Ersetze die Platzhalter mit deinen echten Supabase Werten!
 import os
 from supabase import create_client, Client
 
-supabase_url: str = os.getenv("SUPABASE_LOCAL_URL", "http://127.0.0.1:54321") # Hole aus ENV oder nutze Default
-supabase_key: str = os.getenv("SUPABASE_LOCAL_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU") # HOLE AUS ENV ODER ERSETZE!
+# Supabase Client Initialisierung
+supabase_url: str = os.getenv("SUPABASE_LOCAL_URL")
+supabase_key: str = os.getenv("SUPABASE_LOCAL_SERVICE_ROLE_KEY")
 
-# Prüfe, ob die Keys gesetzt sind, bevor der Client initialisiert wird
-if "DEIN_SUPABASE_SERVICE_ROLE_KEY_HIER" in supabase_key:
-    print("WARNUNG: SUPABASE_LOCAL_SERVICE_ROLE_KEY ist noch der Platzhalter. Bitte in .env setzen oder in honeypot_routes.py anpassen!")
-    print("Versuche trotzdem mit Default-Key. Dies wird FEHLEN, wenn der Key falsch ist.")
+if not supabase_url or not supabase_key:
+    print("FEHLER: Supabase URL oder Key nicht über Umgebungsvariablen geladen. Bitte .env prüfen!")
+
 
 supabase_client: Client = create_client(supabase_url, supabase_key)
-
 
 router = APIRouter()
 
@@ -52,7 +46,7 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
     else:
         disinformation_content = "Conflicting information detected about network topology. Multiple subnets appear to be in use, some with unusual naming conventions."
 
-    print(f"  Dummy Disinformation Generated: {disinformation_content}")
+    print(f"  Dummy Desinformation Generated: {disinformation_content}")
 
     # Hier wird der Log in Supabase gespeichert
     try:
@@ -64,7 +58,6 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
 
     except Exception as e:
         print(f"  (Honeypot-Router) Unerwarteter Fehler beim Speichern des Logs: {e}")
-
 
     return {
         "status": "success",
