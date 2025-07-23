@@ -5,6 +5,7 @@ target/ # Rust build artifacts
 __pycache__/
 *.pyc
 venv/ # Python virtual environments
+.env.local
 
 # Next.js
 .next/
