@@ -1,12 +1,15 @@
 ﻿# Standard ignores
 .DS_Store
 node_modules/
-target/ # Rust build artifacts
+target/ 
 __pycache__/
 *.pyc
-venv/ # Python virtual environments
-/frontend/.env.local
-/backend/rust_honeypots/.env
+venv/ 
+# Environment variables
+.env
+.env.local
+**/.env          
+**/.env.local   
 
 # Next.js
 .next/
@@ -14,7 +17,7 @@ out/
 
 # Supabase (if local setup)
 .supabase/
-supabase/migrations/*.sql # If you generate them locally and don't want to track all
+supabase/migrations/*.sql 
 
 # Logs
 *.log
