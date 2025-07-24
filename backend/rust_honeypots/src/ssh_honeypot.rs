@@ -2,17 +2,18 @@
 
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Für read_exact, write_all
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::{json, Value};
 use crate::common::SharedAppState;
 use std::time::Duration; // Für Read-Timeout
+use std::convert::TryInto; // Für TryInto
 
 // Öffentliche Funktion zum Starten des SSH-Honeypots
 pub async fn start_ssh_honeypot(app_state: SharedAppState) {
     let ssh_addr = SocketAddr::from(([0, 0, 0, 0], 2222)); // SSH auf Port 2222
     println!("SSH Honeypot lauscht auf http://{}", ssh_addr);
 
-    let mut listener = TcpListener::bind(ssh_addr).await.unwrap();
+    let listener = TcpListener::bind(ssh_addr).await.unwrap();
 
     loop {
         match listener.accept().await {
@@ -33,65 +34,36 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
     let client_ip = client_addr.ip().to_string();
     let client_port = client_addr.port();
 
-    // Schritt 1: Senden einer SSH-Protokollversion (Dummy)
-    let server_banner = "SSH-2.0-OpenSSH_7.6p1 Ubuntu-4ubuntu0.3\r\n"; // Standard OpenSSH Banner
+    // Schritt 1: Senden des Server-Banners
+    // Wir senden immer noch einen SSH-Banner, da Clients das erwarten.
+    let server_banner = "SSH-2.0-OpenSSH_7.6p1 EchoChamber-Honeypot\r\n"; // Angepasster Banner
     if let Err(e) = stream.write_all(server_banner.as_bytes()).await {
         eprintln!("Fehler beim Senden des SSH Banners an {}: {:?}", client_addr, e);
+        let _ = stream.shutdown().await;
         return;
     }
 
-    // Schritt 2: Empfangen der Client-Protokollversion und erster Daten
-    let mut buffer = vec![0; 1024]; // Puffer für eingehende Daten
-    let n_bytes_read = tokio::time::timeout(
-        Duration::from_secs(5), // Timeout nach 5 Sekunden
-        stream.read(&mut buffer)
-    ).await;
-
-    let client_data_raw = match n_bytes_read {
-        Ok(Ok(n)) => String::from_utf8_lossy(&buffer[..n]).into_owned(),
-        Ok(Err(e)) => { eprintln!("Fehler beim Lesen von SSH-Daten von {}: {:?}", client_addr, e); return; },
-        Err(_) => { eprintln!("Timeout beim Lesen von SSH-Daten von {}", client_addr); return; }, // Timeout Error
+    // Schritt 2: Empfangen des Client-Banners (und erster Daten)
+    let mut client_banner_buf = vec![0; 255]; // Max SSH banner length is 255
+    let client_data_raw = match tokio::time::timeout(
+        Duration::from_secs(2), // Gebe dem Client 2 Sekunden Zeit, den Banner zu senden
+        stream.read(&mut client_banner_buf)
+    ).await {
+        Ok(Ok(n)) => String::from_utf8_lossy(&client_banner_buf[..n]).into_owned(),
+        _ => String::from("No client banner or read error"),
     };
 
-    println!("SSH Honeypot: Rohdaten von {} erhalten: {}", client_addr, client_data_raw.trim());
+    println!("SSH Honeypot: Client-Banner erhalten: {}", client_data_raw.trim());
 
-    // Versuch, Anmeldedaten zu extrahieren (sehr rudimentär!)
-    // In einem echten Honeypot würde man hier komplexere SSH-Protokoll-Parsing-Bibliotheken verwenden.
-    // Dies ist ein Heuristik-Ansatz für Login-Versuche.
-    let mut username_attempt = "unknown";
-    let mut password_attempt = "unknown";
-    let mut login_method = "raw_tcp_interception";
+    // Rudimentäre Erkennung von Anmeldedaten im Rohdatenstrom
+    let username_attempt = extract_from_raw(&client_data_raw, "user", "username").unwrap_or("unknown".to_string());
+    let password_attempt = extract_from_raw(&client_data_raw, "pass", "password").unwrap_or("unknown".to_string());
+    let login_method = if client_data_raw.contains("ssh-connection") { "ssh_client_attempt" } else { "raw_tcp_interception" };
 
-    // Einfacher Regex-ähnlicher Match für "user XYZ" oder "pass ABC" im Rohdaten-Stream
-    if let Some(user_idx) = client_data_raw.find("user") {
-        if let Some(user_end_idx) = client_data_raw[user_idx..].find("\n") {
-            let user_line = &client_data_raw[user_idx..user_idx + user_end_idx];
-            if let Some(eq_idx) = user_line.find("=") {
-                username_attempt = user_line[eq_idx+1..].trim();
-            } else {
-                username_attempt = user_line["user ".len()..].trim();
-            }
-        }
-    }
-    if let Some(pass_idx) = client_data_raw.find("pass") {
-        if let Some(pass_end_idx) = client_data_raw[pass_idx..].find("\n") {
-            let pass_line = &client_data_raw[pass_idx..pass_idx + pass_end_idx];
-            if let Some(eq_idx) = pass_line.find("=") {
-                password_attempt = pass_line[eq_idx+1..].trim();
-            } else {
-                password_attempt = pass_line["pass ".len()..].trim();
-            }
-        }
-    }
-    if client_data_raw.contains("ssh-connection") {
-        login_method = "ssh_client_attempt";
-        // In einem echten Szenario würde man hier die SSH-Protokollspezifikation parsen
-        // und nicht nach "user" oder "pass" als Substring suchen.
-    }
 
     // Daten für Supabase und KI vorbereiten
     let interaction_data = json!({
-        "client_banner": client_data_raw.trim(), // Rohdaten des Clients
+        "client_banner": client_data_raw.trim(),
         "username_attempt": username_attempt,
         "password_attempt": password_attempt,
         "login_method": login_method,
@@ -99,18 +71,44 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
         "client_port": client_port,
     });
 
-    // Logge in Supabase und sende an KI
-    log_ssh_interaction(interaction_data, client_addr, state).await;
+    // Logge in Supabase und sende an KI.
+    // Die KI wird die Desinformation formulieren, um auf eine HTTP-Seite zu verweisen.
+    let (disinformation_content, _ki_response_raw) = log_ssh_interaction(interaction_data, client_addr, state.clone()).await;
+    
+    // Die Antwort an den SSH-Client wird einfach ein generischer Fehler sein,
+    // da wir die Desinformation über HTTP liefern.
+    let response_message = format!("Authentication failed. Please check server status at http://{}:8080/system-status?ref={}\r\n", client_ip, "your_session_id_here"); // Dummy-ID
+    // Hier können wir die Desinformation in den Query-Parameter einbetten
+    let encoded_disinfo = urlencoding::encode(&disinformation_content).into_owned();
+    let final_response_message = format!("Authentication failed. For more information, please visit http://{}:8080/system-status?details={}\r\n", client_ip, encoded_disinfo);
 
-    // Senden einer Antwort (Dummy-Fehlermeldung)
-    let response_banner = "Protocol mismatch.\r\n"; // Oder "Authentication failed."
-    if let Err(e) = stream.write_all(response_banner.as_bytes()).await {
-        eprintln!("Fehler beim Senden der SSH-Antwort an {}: {:?}", client_addr, e);
+
+    if let Err(e) = stream.write_all(final_response_message.as_bytes()).await {
+        eprintln!("Fehler beim Senden der Antwort an {}: {:?}", client_addr, e);
     }
+    
+    // Verbindung sauber schließen
+    let _ = stream.shutdown().await;
 }
 
-// Funktion zum Loggen und Weiterleiten von SSH-Interaktionen
-async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, state: SharedAppState) {
+// Helper function to extract simple key-value from raw string, if found
+fn extract_from_raw(raw_data: &str, key_prefix: &str, _default_value: &str) -> Option<String> {
+    let lower_raw = raw_data.to_lowercase();
+    if let Some(start_idx) = lower_raw.find(key_prefix) {
+        let after_key = &raw_data[start_idx + key_prefix.len()..];
+        if let Some(val_start_idx) = after_key.find(|c: char| c == '=' || c.is_whitespace()) {
+            let value_part = &after_key[val_start_idx..];
+            if let Some(val_end_idx) = value_part.find('\n') {
+                return Some(value_part[..val_end_idx].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+
+// Funktion zum Loggen und Weiterleiten von SSH-Interaktionen (Unverändert)
+async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, state: SharedAppState) -> (String, Value) { // Rückgabe von String und Value
     let client_ip = client_addr.ip().to_string();
 
     println!("SSH Honeypot: Logge SSH-Interaktion von {}", client_ip);
@@ -118,8 +116,8 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
     // --- 1. Logge in Supabase (attacker_logs) ---
     let supabase_log_payload = json!({
         "source_ip": client_ip,
-        "honeypot_type": "ssh", // SSH-Typ
-        "interaction_data": interaction_data, // SSH-spezifische Daten
+        "honeypot_type": "ssh",
+        "interaction_data": interaction_data,
         "status": "logged"
     });
 
@@ -150,15 +148,18 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
         }
     }
 
-    // --- 2. Sende Daten an Python KI-Mockup ---
+    // --- 2. Sende Daten an Python KI-Mockup und erhalte Desinformation ---
     let ki_api_endpoint = format!("{}/analyze/and-disinform/", state.python_ai_url);
 
     let ki_payload = json!({
         "source_ip": client_ip,
-        "honeypot_type": "ssh", // SSH-Typ
-        "interaction_data": interaction_data, // SSH-spezifische Daten
+        "honeypot_type": "ssh",
+        "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    let mut disinformation_content = String::from("Authentication failed. Try again.");
+    let mut ki_response_raw = Value::Null;
 
     match state.http_client
         .post(&ki_api_endpoint)
@@ -172,7 +173,15 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
             if status_code.is_success() {
                 println!("SSH Daten erfolgreich an Python KI-Mockup gesendet. Status: {}", status_code);
                 if let Ok(ki_response_body) = res.json::<Value>().await {
-                    println!("Antwort von KI-Mockup: {:?}", ki_response_body);
+                    if let Some(payload) = ki_response_body.get("disinformation_payload") {
+                        if let Some(content) = payload.get("content") {
+                            if let Some(s) = content.as_str() {
+                                disinformation_content = s.to_string();
+                            }
+                        }
+                    }
+                    ki_response_raw = ki_response_body;
+                    println!("Antwort von KI-Mockup: {:?}", ki_response_raw);
                 } else {
                     eprintln!("Fehler beim Parsen der KI-Antwort (kein JSON?): {}", status_code);
                 }
@@ -185,6 +194,8 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
         },
         Err(e) => {
             eprintln!("Fehler beim Senden der Anfrage an Python KI-Mockup: {:?}", e);
+            disinformation_content = "KI-Fehler: Konnte keine Antwort erhalten.".to_string(); // Fallback for network errors
         }
     }
+    (disinformation_content, ki_response_raw)
 }

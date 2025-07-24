@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use axum::http::{HeaderMap, Method, Version};
 use url::Url;
 
-use crate::common::SharedAppState; // Importiere SharedAppState aus dem 'common' Modul
+use crate::common::SharedAppState;
 
 // Öffentlicher Router, damit er von main.rs eingebunden werden kann
 pub fn create_http_router(app_state: SharedAppState) -> Router {
@@ -27,37 +27,43 @@ pub fn create_http_router(app_state: SharedAppState) -> Router {
 async fn honeypot_handler(
     method: Method,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<SharedAppState>, // Verwende SharedAppState
+    State(state): State<SharedAppState>,
     uri: OriginalUri,
     headers: HeaderMap,
     http_version: Version,
 ) -> impl IntoResponse {
-    log_http_interaction(method, addr, state, uri, headers, http_version, None).await
+    let (disinformation_content, _) = log_http_interaction(method, addr, state, uri, headers, http_version, None).await;
+    
+    // Dynamische HTML-Antwort generieren
+    Html(generate_dynamic_html_response(disinformation_content).await)
 }
 
 // Handler für POST-Anfragen (mit Body-Extraction)
 async fn honeypot_handler_post(
     method: Method,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<SharedAppState>, // Verwende SharedAppState
+    State(state): State<SharedAppState>,
     uri: OriginalUri,
     headers: HeaderMap,
     http_version: Version,
     body: String, // Extrahiere den Request Body als String
 ) -> impl IntoResponse {
-    log_http_interaction(method, addr, state, uri, headers, http_version, Some(body)).await
+    let (disinformation_content, _) = log_http_interaction(method, addr, state, uri, headers, http_version, Some(body)).await;
+    
+    // Dynamische HTML-Antwort generieren
+    Html(generate_dynamic_html_response(disinformation_content).await)
 }
 
 // Allgemeine Funktion zum Loggen und Weiterleiten von HTTP-Interaktionen
 async fn log_http_interaction(
     method: Method,
     addr: SocketAddr,
-    state: SharedAppState, // Verwende SharedAppState
+    state: SharedAppState,
     uri: OriginalUri,
     headers: HeaderMap,
     http_version_raw: Version,
     request_body: Option<String>,
-) -> impl IntoResponse {
+) -> (String, Value) { // Rückgabe von (Desinformationstext, Roh-KI-Antwort)
     let client_ip = addr.ip().to_string();
     let client_port = addr.port();
     let full_uri = uri.to_string();
@@ -173,7 +179,7 @@ async fn log_http_interaction(
         }
     }
 
-    // --- 2. Sende Daten an Python KI-Mockup ---
+    // --- 2. Sende Daten an Python KI-Mockup und erhalte Desinformation ---
     let ki_api_endpoint = format!("{}/analyze/and-disinform/", state.python_ai_url);
 
     let ki_payload = json!({
@@ -182,6 +188,9 @@ async fn log_http_interaction(
         "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    let mut disinformation_content = String::from("Ein unerwarteter Fehler ist aufgetreten. Die angeforderte Ressource konnte nicht gefunden werden.");
+    let mut ki_response_raw = Value::Null;
 
     match state.http_client
         .post(&ki_api_endpoint)
@@ -195,7 +204,15 @@ async fn log_http_interaction(
             if status_code.is_success() {
                 println!("Daten erfolgreich an Python KI-Mockup gesendet. Status: {}", status_code);
                 if let Ok(ki_response_body) = res.json::<Value>().await {
-                    println!("Antwort von KI-Mockup: {:?}", ki_response_body);
+                    if let Some(payload) = ki_response_body.get("disinformation_payload") {
+                        if let Some(content) = payload.get("content") {
+                            if let Some(s) = content.as_str() {
+                                disinformation_content = s.to_string();
+                            }
+                        }
+                    }
+                    ki_response_raw = ki_response_body;
+                    println!("Antwort von KI-Mockup: {:?}", ki_response_raw);
                 } else {
                     eprintln!("Fehler beim Parsen der KI-Antwort (kein JSON?): {}", status_code);
                 }
@@ -211,6 +228,43 @@ async fn log_http_interaction(
         }
     }
 
-    // Dummy-Antwort an den Angreifer
-    Html("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested URL was not found on this server.</p></body></html>")
+    // Rückgabe der Desinformation und der rohen KI-Antwort
+    (disinformation_content, ki_response_raw)
 }
+
+// NEU: Funktion zur Generierung einer dynamischen HTML-Antwort
+async fn generate_dynamic_html_response(disinformation_text: String) -> String {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Systemmeldung: Interner Fehler</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f2f5; color: #333; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
+        .container {{ background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); max-width: 600px; text-align: center; }}
+        h1 {{ color: #d32f2f; font-size: 2.5em; margin-bottom: 20px; }}
+        p {{ font-size: 1.1em; line-height: 1.6; color: #555; }}
+        .error-code {{ font-family: 'Consolas', monospace; background-color: #eee; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-top: 15px; color: #777; }}
+        .disinfo-message {{ background-color: #e8f5e9; color: #388e3c; padding: 15px; border-left: 5px solid #4caf50; margin-top: 25px; border-radius: 4px; text-align: left; }}
+        .footer {{ margin-top: 30px; font-size: 0.9em; color: #888; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Zugriff verweigert oder Fehler</h1>
+        <p>Leider konnte Ihre Anfrage nicht wie gewünscht bearbeitet werden.</p>
+        <div class="disinfo-message">
+            <strong>Wichtige Systeminformationen:</strong><br>
+            {}
+        </div>
+        <p class="footer">Bitte kontaktieren Sie den Systemadministrator, falls Sie weitere Unterstützung benötigen.</p>
+    </div>
+</body>
+</html>"#,
+        disinformation_text
+    );
+    html
+}
+
