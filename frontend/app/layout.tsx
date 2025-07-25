@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -9,7 +9,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Project Guardian - Honeypot Dashboard",
+  title: "TRAPD",
   description:
     "Advanced honeypot monitoring and threat detection dashboard for cybersecurity professionals",
   keywords: [
@@ -19,9 +19,15 @@ export const metadata: Metadata = {
     "monitoring",
     "security",
   ],
-  authors: [{ name: "Project Guardian Team" }],
-  viewport: "width=device-width, initial-scale=1",
+  authors: [{ name: "Marvin" }],
   robots: "noindex, nofollow", // Security dashboard shouldn't be indexed
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#1e40af",
+  colorScheme: "dark light",
 };
 
 export default function RootLayout({
@@ -32,9 +38,10 @@ export default function RootLayout({
   return (
     <html lang="de" className="scroll-smooth" suppressHydrationWarning>
       <head>
-        <link rel="icon" href="/favicon.ico" />
-        <meta name="theme-color" content="#1e40af" />
-        <meta name="color-scheme" content="dark light" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+        <link rel="manifest" href="/site.webmanifest" />
       </head>
       <body
         className={`${inter.variable} font-sans antialiased bg-background text-foreground min-h-screen transition-colors duration-300`}
@@ -57,3 +64,4 @@ export default function RootLayout({
     </html>
   );
 }
+

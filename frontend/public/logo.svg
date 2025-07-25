@@ -1,0 +1,13 @@
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+
+  
+  <!-- Main hexagon shape - simple and clean -->
+  <polygon points="100,50 130,70 130,130 100,150 70,130 70,70" 
+           fill="black" 
+           stroke="none"/>
+  
+  <!-- Inner cutout hexagon for the "honeypot" concept -->
+  <polygon points="100,80 115,90 115,110 100,120 85,110 85,90" 
+           fill="white" 
+           stroke="none"/>
+</svg>
