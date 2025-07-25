@@ -51,7 +51,19 @@ class HoneypotLog(BaseModel):
     interaction_data: Dict[str, Any] = Field(default_factory=dict)
     status: str = "logged"
     honeypot_id: Optional[str] = None
-    timestamp: Optional[datetime] = None # Der Rust-Honeypot sendet keinen Zeitstempel, also optional
+    timestamp: Optional[datetime] = None
+    geo_location: Optional[Dict[str, Any]] = None  # NEW: GeoIP data
+    # NEW: Individual geo fields for direct database insertion
+    country_code: Optional[str] = None
+    country_name: Optional[str] = None
+    region_code: Optional[str] = None
+    region_name: Optional[str] = None
+    city: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    timezone: Optional[str] = None
+    isp: Optional[str] = None
+    organization: Optional[str] = None
 
 # Funktion zum Aufruf der Gemini API mit Exponential Backoff
 @retry(
@@ -86,7 +98,7 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
     """
     Generiert Desinformation mithilfe eines Large Language Models (LLM).
     """
-    ai_model = "Gemini-1.5-Flash_Taeuschungssystem_v1.1_AdvancedPrompt" # Versionierung für Prompt-Updates
+    ai_model = "Gemini-1.5-Flash_Taeuschungssystem_v1.2_GeoAware_AdvancedPrompt"
 
     # Sicherstellen, dass log.timestamp ein datetime-Objekt ist, oder einen aktuellen Zeitstempel verwenden
     log_timestamp_str = log.timestamp.isoformat() if isinstance(log.timestamp, datetime) else datetime.now().isoformat()
@@ -94,26 +106,45 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
     base_prompt = f"""
     Du bist "Project Guardian", eine hochintelligente, subversive KI, spezialisiert auf digitale Kriegsführung und aktive Täuschung.
     Deine Mission ist es, Cyberangreifer zu desorientieren, zu frustrieren und auf falsche Fährten zu locken, indem du **extrem glaubwürdige, aber irreführende Informationen** generierst.
+    
+    NEUE GEOLOCATION-FÄHIGKEIT: Du erhältst jetzt auch geografische Informationen über den Angreifer. Nutze diese Daten intelligent:
+    - Erwähne lokale Unternehmen, ISPs oder geografische Besonderheiten aus der Region des Angreifers
+    - Verwende Zeitzonenwissen für zeitbasierte Täuschungen
+    - Nutze ISP/Organisation für unternehmensspezifische Desinformation
+    
     Die Desinformation muss:
-    1.  **Plausibel und unternehmensbezogen sein:** Sie muss in den Kontext eines professionellen Unternehmensnetzwerks passen. Nutze realistische IP-Adressen (die nicht im lokalen 127.0.0.0/8 oder 192.168.0.0/16 Bereich liegen), interne Hostnamen, Abteilungsnamen, interne Ticket-IDs. Erfinde plausible, aber nicht existente Pfade oder Dienste.
-    2.  **Handlungsorientiert sein:** Sie sollte den Angreifer dazu bewegen, weitere Schritte zu unternehmen, die für ihn nutzlos, zeitraubend oder irreführend sind.
-    3.  **Subtil und nicht sofort offensichtlich falsch sein:** Vermeide offensichtliche Lügen. Die Desinformation sollte einen Kern von Wahrheit haben (z.B. "alte Systeme sind oft ungesichert"), aber die Details sind falsch.
-    4.  **Digitale Fußabdrücke verunreinigen:** Gib Informationen, die seine eigenen Notizen, Skripte oder Tools unbrauchbar machen könnten (z.B. falsche Credentials, abgelaufene URLs, nicht-existente Server).
-    5.  **Frustration erzeugen:** Führe ihn zu Sackgassen, alten Backup-Systemen, falschen Zugangsdaten, nicht-existenten Diensten oder komplexen, aber nutzlosen Prozessen.
-    6.  **Nutze den Kontext maximal aus:** Beziehe dich direkt und intelligent auf ALLE Interaktionsdaten des Angreifers (IP, Typ, Pfad, User-Agent, Benutzernamen, Passwörter, etc.).
-    7.  **Antwortformat:** Antworte NUR mit dem Desinformationstext. KEINE Erklärungen, Überschriften, Begrüßungen, Abschiede oder Metadaten. Formatiere es als klar lesbaren Text, der wie eine Systemmeldung, ein interner Log-Eintrag oder eine Support-Nachricht aussehen könnte.
+    1.  **Geolocation-bewusst und regional relevant sein:** Integriere geografische Daten geschickt in die Täuschung
+    2.  **Plausibel und unternehmensbezogen sein:** Sie muss in den Kontext eines professionellen Unternehmensnetzwerks passen
+    3.  **Handlungsorientiert sein:** Sie sollte den Angreifer dazu bewegen, weitere nutzlose Schritte zu unternehmen
+    4.  **Subtil und nicht sofort offensichtlich falsch sein:** Vermeide offensichtliche Lügen
+    5.  **Digitale Fußabdrücke verunreinigen:** Gib Informationen, die seine Tools unbrauchbar machen
+    6.  **Frustration erzeugen:** Führe ihn zu Sackgassen und falschen Zielen
+    7.  **Nutze ALLE Kontextdaten maximal aus:** IP, Geo-Daten, Interaktionsdetails, etc.
+    8.  **Antwortformat:** Antworte NUR mit dem Desinformationstext. KEINE Metadaten.
 
-    Hier sind die Honeypot-Interaktionsdaten und der Kontext:
+    Hier sind die Honeypot-Interaktionsdaten mit geografischen Informationen:
     """
 
     prompt_data = {
         "honeypot_type": log.honeypot_type,
         "source_ip": log.source_ip,
         "timestamp": log_timestamp_str,
-        "interaction_details": log.interaction_data
+        "interaction_details": log.interaction_data,
+        "geo_location": log.geo_location  # NEW: Include geo data in prompt
     }
     full_prompt = base_prompt + json.dumps(prompt_data, indent=2) + "\n\n"
     
+    # Add geo-aware prompting
+    if log.geo_location:
+        geo = log.geo_location
+        if geo.get("country_name"):
+            full_prompt += f"Der Angreifer kommt aus {geo.get('country_name')} "
+            if geo.get("city"):
+                full_prompt += f"(Stadt: {geo.get('city')}) "
+            if geo.get("isp"):
+                full_prompt += f"und nutzt den ISP: {geo.get('isp')} "
+            full_prompt += ". Nutze diese geografischen Informationen, um lokale Referenzen, Zeitzonen-spezifische Hinweise oder ISP-bezogene Desinformation zu erstellen. "
+
     # Füge spezifische, detaillierte Anweisungen basierend auf dem Honeypot-Typ und den Details hinzu
     if log.honeypot_type == "http":
         request_path = log.interaction_data.get("request_path", "").lower()
@@ -186,7 +217,24 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
     Empfängt einen Honeypot-Log, analysiert ihn mit LLM-basierter KI und generiert Desinformation.
     """
     print(f"[{datetime.now()}] (Honeypot-Router) Received log from {log.source_ip} ({log.honeypot_type}):")
+    if log.geo_location:
+        geo = log.geo_location
+        print(f"  GeoLocation: {geo.get('city', 'Unknown')}, {geo.get('country_name', 'Unknown')} | ISP: {geo.get('isp', 'Unknown')}")
     print(f"  Interaction Data: {json.dumps(log.interaction_data, indent=2)}")
+
+    # Extract geo fields from geo_location if present
+    if log.geo_location:
+        geo = log.geo_location
+        log.country_code = geo.get("country_code")
+        log.country_name = geo.get("country_name") 
+        log.region_code = geo.get("region_code")
+        log.region_name = geo.get("region_name")
+        log.city = geo.get("city")
+        log.latitude = geo.get("latitude")
+        log.longitude = geo.get("longitude")
+        log.timezone = geo.get("timezone")
+        log.isp = geo.get("isp")
+        log.organization = geo.get("organization")
 
     # KORRIGIERT: Erstelle eine veränderbare Kopie des Log-Objekts für die Bereinigung
     cleaned_log_data = log.dict() 

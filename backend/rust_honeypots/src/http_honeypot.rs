@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use axum::http::{HeaderMap, Method, Version};
 use url::Url;
 
-use crate::common::SharedAppState;
+use crate::common::{SharedAppState, lookup_geoip};
 
 // Öffentlicher Router, damit er von main.rs eingebunden werden kann
 pub fn create_http_router(app_state: SharedAppState) -> Router {
@@ -32,6 +32,13 @@ async fn honeypot_handler(
     headers: HeaderMap,
     http_version: Version,
 ) -> impl IntoResponse {
+    // Filter für Browser-spezifische Anfragen (Favicon, etc.)
+    let request_path = uri.path();
+    if should_ignore_request(request_path, &headers) {
+        println!("Ignoriere Browser-Anfrage: {}", request_path);
+        return Html(generate_simple_404().await);
+    }
+
     let (disinformation_content, _) = log_http_interaction(method, addr, state, uri, headers, http_version, None).await;
     
     // Dynamische HTML-Antwort generieren
@@ -48,6 +55,13 @@ async fn honeypot_handler_post(
     http_version: Version,
     body: String, // Extrahiere den Request Body als String
 ) -> impl IntoResponse {
+    // Filter für Browser-spezifische Anfragen
+    let request_path = uri.path();
+    if should_ignore_request(request_path, &headers) {
+        println!("Ignoriere Browser-POST-Anfrage: {}", request_path);
+        return Html(generate_simple_404().await);
+    }
+
     let (disinformation_content, _) = log_http_interaction(method, addr, state, uri, headers, http_version, Some(body)).await;
     
     // Dynamische HTML-Antwort generieren
@@ -63,14 +77,28 @@ async fn log_http_interaction(
     headers: HeaderMap,
     http_version_raw: Version,
     request_body: Option<String>,
-) -> (String, Value) { // Rückgabe von (Desinformationstext, Roh-KI-Antwort)
+) -> (String, Value) {
     let client_ip = addr.ip().to_string();
     let client_port = addr.port();
     let full_uri = uri.to_string();
     let request_path = uri.path();
     let http_method = method.as_str();
 
-    // Konvertiere HTTP-Version zu String
+    // NEU: Zusätzliche Filterung für verdächtige/interessante Anfragen
+    let is_suspicious_request = is_attack_request(request_path, &headers, &request_body);
+    
+    println!("HTTP Honeypot: {} {} von {} (Verdächtig: {})", 
+             http_method, request_path, client_ip, is_suspicious_request);
+
+    // Nur verdächtige Anfragen loggen (optional - entkommentieren falls gewünscht)
+    // if !is_suspicious_request {
+    //     return (String::from("Request ignored - not suspicious"), Value::Null);
+    // }
+
+    // GeoIP lookup
+    let geo_location = lookup_geoip(addr.ip(), &state.http_client).await;
+    println!("GeoIP for {}: {:?}", client_ip, geo_location);
+
     let http_version_str = format!("{:?}", http_version_raw);
 
     let user_agent = headers.get("User-Agent")
@@ -145,12 +173,44 @@ async fn log_http_interaction(
 
 
     // --- 1. Logge in Supabase (attacker_logs) ---
-    let supabase_log_payload = json!({
+    let mut supabase_log_payload = json!({
         "source_ip": client_ip,
         "honeypot_type": "http",
         "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    // Add GeoIP data to Supabase payload
+    if let Some(country_code) = &geo_location.country_code {
+        supabase_log_payload["country_code"] = json!(country_code);
+    }
+    if let Some(country_name) = &geo_location.country_name {
+        supabase_log_payload["country_name"] = json!(country_name);
+    }
+    if let Some(region_code) = &geo_location.region_code {
+        supabase_log_payload["region_code"] = json!(region_code);
+    }
+    if let Some(region_name) = &geo_location.region_name {
+        supabase_log_payload["region_name"] = json!(region_name);
+    }
+    if let Some(city) = &geo_location.city {
+        supabase_log_payload["city"] = json!(city);
+    }
+    if let Some(latitude) = geo_location.latitude {
+        supabase_log_payload["latitude"] = json!(latitude);
+    }
+    if let Some(longitude) = geo_location.longitude {
+        supabase_log_payload["longitude"] = json!(longitude);
+    }
+    if let Some(timezone) = &geo_location.timezone {
+        supabase_log_payload["timezone"] = json!(timezone);
+    }
+    if let Some(isp) = &geo_location.isp {
+        supabase_log_payload["isp"] = json!(isp);
+    }
+    if let Some(organization) = &geo_location.organization {
+        supabase_log_payload["organization"] = json!(organization);
+    }
 
     let supabase_table_url = format!("{}/rest/v1/attacker_logs", state.supabase_api_url);
 
@@ -182,12 +242,15 @@ async fn log_http_interaction(
     // --- 2. Sende Daten an Python KI-Mockup und erhalte Desinformation ---
     let ki_api_endpoint = format!("{}/analyze/and-disinform/", state.python_ai_url);
 
-    let ki_payload = json!({
+    let mut ki_payload = json!({
         "source_ip": client_ip,
         "honeypot_type": "http",
         "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    // Add GeoIP data to AI payload
+    ki_payload["geo_location"] = json!(geo_location);
 
     let mut disinformation_content = String::from("Ein unerwarteter Fehler ist aufgetreten. Die angeforderte Ressource konnte nicht gefunden werden.");
     let mut ki_response_raw = Value::Null;
@@ -266,5 +329,94 @@ async fn generate_dynamic_html_response(disinformation_text: String) -> String {
         disinformation_text
     );
     html
+}
+
+// NEU: Funktion zur Filterung von Browser-spezifischen Anfragen
+fn should_ignore_request(path: &str, headers: &HeaderMap) -> bool {
+    // Liste der Pfade, die ignoriert werden sollen
+    let ignore_paths = [
+        "/favicon.ico",
+        "/robots.txt",
+        "/sitemap.xml",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+        "/.well-known/security.txt",
+        "/browserconfig.xml",
+        "/manifest.json"
+    ];
+    
+    // Prüfe, ob der Pfad in der Ignore-Liste steht
+    if ignore_paths.contains(&path) {
+        return true;
+    }
+    
+    // Ignoriere Preflight OPTIONS-Anfragen für CORS
+    if let Some(method) = headers.get("access-control-request-method") {
+        if method.to_str().unwrap_or("").to_uppercase() == "OPTIONS" {
+            return true;
+        }
+    }
+    
+    // Ignoriere Service Worker Anfragen
+    if path.starts_with("/sw.js") || path.starts_with("/service-worker") {
+        return true;
+    }
+    
+    false
+}
+
+// NEU: Einfache 404-Antwort für ignorierte Anfragen
+async fn generate_simple_404() -> String {
+    r#"<!DOCTYPE html>
+<html>
+<head><title>404 Not Found</title></head>
+<body><h1>404 Not Found</h1><p>The requested resource was not found.</p></body>
+</html>"#.to_string()
+}
+
+// NEU: Funktion zur Erkennung von Angriffs-Anfragen
+fn is_attack_request(path: &str, headers: &HeaderMap, body: &Option<String>) -> bool {
+    let path_lower = path.to_lowercase();
+    
+    // Verdächtige Pfade (typische Angriffsmuster)
+    let suspicious_paths = [
+        "admin", "login", "phpmyadmin", "wp-admin", "wp-login",
+        "config", ".env", "backup", "database", "sql",
+        "shell", "webshell", "cmd", "phpinfo",
+        "exploit", "backdoor", "upload"
+    ];
+    
+    // Prüfe auf verdächtige Pfade
+    if suspicious_paths.iter().any(|&pattern| path_lower.contains(pattern)) {
+        return true;
+    }
+    
+    // Prüfe User-Agent für Scanner/Bots
+    if let Some(user_agent) = headers.get("User-Agent") {
+        if let Ok(ua_str) = user_agent.to_str() {
+            let ua_lower = ua_str.to_lowercase();
+            let scanner_patterns = [
+                "nmap", "masscan", "gobuster", "dirb", "sqlmap",
+                "nikto", "burp", "scanner", "bot", "crawl"
+            ];
+            if scanner_patterns.iter().any(|&pattern| ua_lower.contains(pattern)) {
+                return true;
+            }
+        }
+    }
+    
+    // Prüfe Body auf verdächtige Inhalte (falls vorhanden)
+    if let Some(body_content) = body {
+        let body_lower = body_content.to_lowercase();
+        if body_lower.contains("select") && body_lower.contains("from") ||
+           body_lower.contains("union") && body_lower.contains("select") ||
+           body_lower.contains("<script") ||
+           body_lower.contains("javascript:") {
+            return true;
+        }
+    }
+    
+    // Alle anderen Anfragen als "normal" betrachten (aber trotzdem loggen)
+    true // Setzen Sie auf false, wenn Sie nur Angriffe loggen möchten
 }
 

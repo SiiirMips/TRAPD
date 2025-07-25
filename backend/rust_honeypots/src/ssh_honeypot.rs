@@ -4,9 +4,8 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::{json, Value};
-use crate::common::SharedAppState;
-use std::time::Duration; // Für Read-Timeout
-use std::convert::TryInto; // Für TryInto
+use crate::common::{SharedAppState, lookup_geoip};
+use std::time::Duration;
 
 // Öffentliche Funktion zum Starten des SSH-Honeypots
 pub async fn start_ssh_honeypot(app_state: SharedAppState) {
@@ -35,8 +34,7 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
     let client_port = client_addr.port();
 
     // Schritt 1: Senden des Server-Banners
-    // Wir senden immer noch einen SSH-Banner, da Clients das erwarten.
-    let server_banner = "SSH-2.0-OpenSSH_7.6p1 EchoChamber-Honeypot\r\n"; // Angepasster Banner
+    let server_banner = "SSH-2.0-OpenSSH_7.6p1 EchoChamber-Honeypot\r\n";
     if let Err(e) = stream.write_all(server_banner.as_bytes()).await {
         eprintln!("Fehler beim Senden des SSH Banners an {}: {:?}", client_addr, e);
         let _ = stream.shutdown().await;
@@ -44,9 +42,9 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
     }
 
     // Schritt 2: Empfangen des Client-Banners (und erster Daten)
-    let mut client_banner_buf = vec![0; 255]; // Max SSH banner length is 255
+    let mut client_banner_buf = vec![0; 255];
     let client_data_raw = match tokio::time::timeout(
-        Duration::from_secs(2), // Gebe dem Client 2 Sekunden Zeit, den Banner zu senden
+        Duration::from_secs(2),
         stream.read(&mut client_banner_buf)
     ).await {
         Ok(Ok(n)) => String::from_utf8_lossy(&client_banner_buf[..n]).into_owned(),
@@ -60,7 +58,6 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
     let password_attempt = extract_from_raw(&client_data_raw, "pass", "password").unwrap_or("unknown".to_string());
     let login_method = if client_data_raw.contains("ssh-connection") { "ssh_client_attempt" } else { "raw_tcp_interception" };
 
-
     // Daten für Supabase und KI vorbereiten
     let interaction_data = json!({
         "client_banner": client_data_raw.trim(),
@@ -72,16 +69,12 @@ async fn handle_ssh_connection(mut stream: TcpStream, client_addr: SocketAddr, s
     });
 
     // Logge in Supabase und sende an KI.
-    // Die KI wird die Desinformation formulieren, um auf eine HTTP-Seite zu verweisen.
     let (disinformation_content, _ki_response_raw) = log_ssh_interaction(interaction_data, client_addr, state.clone()).await;
     
-    // Die Antwort an den SSH-Client wird einfach ein generischer Fehler sein,
-    // da wir die Desinformation über HTTP liefern.
-    let response_message = format!("Authentication failed. Please check server status at http://{}:8080/system-status?ref={}\r\n", client_ip, "your_session_id_here"); // Dummy-ID
-    // Hier können wir die Desinformation in den Query-Parameter einbetten
+    // Die Antwort an den SSH-Client wird einfach ein generischer Fehler sein
+    let _response_message = format!("Authentication failed. Please check server status at http://{}:8080/system-status?ref={}\r\n", client_ip, "your_session_id_here");
     let encoded_disinfo = urlencoding::encode(&disinformation_content).into_owned();
     let final_response_message = format!("Authentication failed. For more information, please visit http://{}:8080/system-status?details={}\r\n", client_ip, encoded_disinfo);
-
 
     if let Err(e) = stream.write_all(final_response_message.as_bytes()).await {
         eprintln!("Fehler beim Senden der Antwort an {}: {:?}", client_addr, e);
@@ -106,20 +99,55 @@ fn extract_from_raw(raw_data: &str, key_prefix: &str, _default_value: &str) -> O
     None
 }
 
-
-// Funktion zum Loggen und Weiterleiten von SSH-Interaktionen (Unverändert)
-async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, state: SharedAppState) -> (String, Value) { // Rückgabe von String und Value
+// Funktion zum Loggen und Weiterleiten von SSH-Interaktionen
+async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, state: SharedAppState) -> (String, Value) {
     let client_ip = client_addr.ip().to_string();
+
+    // GeoIP lookup
+    let geo_location = lookup_geoip(client_addr.ip(), &state.http_client).await;
+    println!("SSH GeoIP for {}: {:?}", client_ip, geo_location);
 
     println!("SSH Honeypot: Logge SSH-Interaktion von {}", client_ip);
 
     // --- 1. Logge in Supabase (attacker_logs) ---
-    let supabase_log_payload = json!({
+    let mut supabase_log_payload = json!({
         "source_ip": client_ip,
         "honeypot_type": "ssh",
         "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    // Add GeoIP data to Supabase payload
+    if let Some(country_code) = &geo_location.country_code {
+        supabase_log_payload["country_code"] = json!(country_code);
+    }
+    if let Some(country_name) = &geo_location.country_name {
+        supabase_log_payload["country_name"] = json!(country_name);
+    }
+    if let Some(region_code) = &geo_location.region_code {
+        supabase_log_payload["region_code"] = json!(region_code);
+    }
+    if let Some(region_name) = &geo_location.region_name {
+        supabase_log_payload["region_name"] = json!(region_name);
+    }
+    if let Some(city) = &geo_location.city {
+        supabase_log_payload["city"] = json!(city);
+    }
+    if let Some(latitude) = geo_location.latitude {
+        supabase_log_payload["latitude"] = json!(latitude);
+    }
+    if let Some(longitude) = geo_location.longitude {
+        supabase_log_payload["longitude"] = json!(longitude);
+    }
+    if let Some(timezone) = &geo_location.timezone {
+        supabase_log_payload["timezone"] = json!(timezone);
+    }
+    if let Some(isp) = &geo_location.isp {
+        supabase_log_payload["isp"] = json!(isp);
+    }
+    if let Some(organization) = &geo_location.organization {
+        supabase_log_payload["organization"] = json!(organization);
+    }
 
     let supabase_table_url = format!("{}/rest/v1/attacker_logs", state.supabase_api_url);
 
@@ -151,12 +179,15 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
     // --- 2. Sende Daten an Python KI-Mockup und erhalte Desinformation ---
     let ki_api_endpoint = format!("{}/analyze/and-disinform/", state.python_ai_url);
 
-    let ki_payload = json!({
+    let mut ki_payload = json!({
         "source_ip": client_ip,
         "honeypot_type": "ssh",
         "interaction_data": interaction_data,
         "status": "logged"
     });
+
+    // Add GeoIP data to AI payload
+    ki_payload["geo_location"] = json!(geo_location);
 
     let mut disinformation_content = String::from("Authentication failed. Try again.");
     let mut ki_response_raw = Value::Null;
@@ -194,7 +225,7 @@ async fn log_ssh_interaction(interaction_data: Value, client_addr: SocketAddr, s
         },
         Err(e) => {
             eprintln!("Fehler beim Senden der Anfrage an Python KI-Mockup: {:?}", e);
-            disinformation_content = "KI-Fehler: Konnte keine Antwort erhalten.".to_string(); // Fallback for network errors
+            disinformation_content = "KI-Fehler: Konnte keine Antwort erhalten.".to_string();
         }
     }
     (disinformation_content, ki_response_raw)
