@@ -3,7 +3,8 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
+from urllib.parse import unquote
 
 import os
 import json
@@ -92,6 +93,95 @@ async def call_gemini_api(prompt_text: str) -> str:
     except Exception as e:
         print(f"  [Gemini API] Fehler beim Aufruf der Gemini API: {e}")
         raise # Fehler für Tenacity erneut werfen
+
+def identify_attack_indicators(log: HoneypotLog) -> List[str]:
+    """Analysiert einen Honeypot-Logeintrag auf häufige Angriffsindikatoren."""
+
+    indicators: List[str] = []
+    honeypot_type = (log.honeypot_type or "").lower()
+    interaction_data = log.interaction_data or {}
+
+    def add_indicator(name: str) -> None:
+        if name not in indicators:
+            indicators.append(name)
+
+    if honeypot_type == "http":
+        request_path = (interaction_data.get("request_path") or "").lower()
+        query_string = (interaction_data.get("query_string") or "").lower()
+        combined_path = f"{request_path} {query_string}".strip()
+        decoded_path = unquote(combined_path)
+
+        directory_traversal_markers = ["../", "..\\", "%2e%2e", "%252e%252e", "/etc/passwd", "c:/windows"]
+        if any(marker in decoded_path for marker in directory_traversal_markers):
+            add_indicator("Directory Traversal")
+
+        method = (interaction_data.get("method") or "").upper()
+        parsed_body = interaction_data.get("parsed_body")
+        credential_fields = {"username", "user", "login", "email"}
+        password_fields = {"password", "pass", "pwd"}
+        credential_lists_present = False
+
+        if isinstance(parsed_body, dict):
+            credential_lists_present = any(
+                isinstance(parsed_body.get(field), list)
+                for field in credential_fields.union(password_fields)
+            ) or "credentials" in parsed_body
+
+        username = None
+        password = None
+        if isinstance(parsed_body, dict):
+            for field in credential_fields:
+                if parsed_body.get(field):
+                    username = parsed_body[field]
+                    break
+            for field in password_fields:
+                if parsed_body.get(field):
+                    password = parsed_body[field]
+                    break
+
+        if method in {"POST", "PUT"} and (
+            (username and password) or credential_lists_present
+        ):
+            add_indicator("Credential-Stuffing")
+
+        user_agent = (interaction_data.get("user_agent") or "").lower()
+        known_http_scanners = [
+            "nmap",
+            "masscan",
+            "nikto",
+            "acunetix",
+            "nessus",
+            "sqlmap",
+            "wpscan",
+            "gobuster",
+            "dirbuster",
+            "shodan",
+        ]
+        if any(scanner in user_agent for scanner in known_http_scanners):
+            add_indicator("Known Scanner")
+
+    elif honeypot_type == "ssh":
+        username_attempt = (interaction_data.get("username_attempt") or "").lower()
+        password_attempt = interaction_data.get("password_attempt")
+        authentication_failures = interaction_data.get("authentication_failures")
+
+        common_usernames = {"root", "admin", "administrator", "test", "guest", "pi"}
+        weak_passwords = {"123456", "password", "admin", "root", "toor", "qwerty"}
+
+        if (
+            username_attempt in common_usernames
+            or (isinstance(password_attempt, str) and password_attempt.lower() in weak_passwords)
+            or (isinstance(authentication_failures, int) and authentication_failures >= 3)
+        ):
+            add_indicator("SSH-Bruteforce")
+
+        client_banner = (interaction_data.get("client_banner") or "").lower()
+        known_ssh_scanners = ["nmap", "masscan", "shodan", "libssh", "sshlib", "paramiko"]
+        if any(scanner in client_banner for scanner in known_ssh_scanners):
+            add_indicator("Known Scanner")
+
+    return indicators
+
 
 # Funktion zur Generierung von LLM-basierter Desinformation
 async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, Any], str]:
@@ -189,6 +279,8 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
     \n\nGeneriere eine detaillierte, mehrschichtige Täuschungsantwort basierend auf allen oben genannten Informationen. Sei kreativ und führe den Angreifer mit glaubwürdigen, aber falschen Details in die Irre. Dein Ziel ist es, ihn zu beschäftigen und seine Ressourcen zu verschwenden.
     """
 
+    analysis_indicators = identify_attack_indicators(log)
+
     disinformation_content = "KI konnte keine plausible Desinformation generieren." # Fallback
 
     try:
@@ -203,6 +295,7 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
         "honeypot_type": log.honeypot_type,
         "source_ip": log.source_ip,
         "analysis_triggered_by": "LLM_Generation",
+        "analysis_rules_triggered": analysis_indicators,
         "llm_prompt": full_prompt, # Speichere den vollen Prompt zu Debugging-Zwecken
         "llm_response_raw": disinformation_content, # Speichere die rohe KI-Antwort
         "generated_timestamp": datetime.now().isoformat()
@@ -281,13 +374,15 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
             print(f"  (Honeypot-Router) Fehler beim Speichern der Desinformation in Supabase: {response.error}")
     except Exception as e:
         print(f"  (Honeypot-Router) Unerwarteter Fehler beim Speichern der Desinformation: {e}")
-
+    identified_ttp = disinformation_context.get("analysis_rules_triggered") or []
+    if not identified_ttp:
+        identified_ttp = ["LLM_Generated"]
 
     return {
         "status": "success",
         "message": "Log processed and disinformation generated.",
         "analysis_summary": "LLM-based analysis completed.",
-        "identified_ttp": disinformation_context.get("analysis_rules_triggered", ["LLM_Generated"]),
+        "identified_ttp": identified_ttp,
         "disinformation_payload": {
             "content": disinformation_content,
             "content_type": "text/plain",
