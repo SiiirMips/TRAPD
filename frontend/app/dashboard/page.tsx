@@ -1,3 +1,7 @@
+"use client"
+
+import { useEffect, useMemo, useState } from "react"
+import { supabase } from "@/supabaseClient"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
   Breadcrumb,
@@ -16,59 +20,304 @@ import {
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
-import { 
-  Activity, 
-  Shield, 
-  AlertTriangle, 
-  Users, 
-  Scan, 
-  Eye, 
-  Globe, 
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Activity,
+  Shield,
+  AlertTriangle,
+  Users,
+  Scan,
+  Eye,
+  Globe,
   Clock,
   TrendingUp,
   Bot,
   Monitor,
-  Fingerprint
+  Fingerprint,
+  Loader2,
 } from "lucide-react"
 
-export default function Page() {
-  // Mock data - in real app würde das von Supabase kommen
-  const mockData = {
-    totalAttacks: 1247,
-    uniqueIPs: 89,
-    threatsBlocked: 234,
-    scannersDetected: 45,
-    realTimeThreat: "HIGH",
-    topScanners: [
-      { name: "Nmap", count: 89, confidence: 0.95 },
-      { name: "Masscan", count: 67, confidence: 0.92 },
-      { name: "Gobuster", count: 45, confidence: 0.88 },
-      { name: "Nikto", count: 32, confidence: 0.85 }
-    ],
-    threatLevels: {
-      critical: 12,
-      high: 34,
-      medium: 67,
-      low: 89
-    },
-    browserFingerprints: 156,
-    countries: [
-      { name: "Russia", count: 234, flag: "🇷🇺" },
-      { name: "China", count: 189, flag: "🇨🇳" },
-      { name: "USA", count: 156, flag: "🇺🇸" },
-      { name: "Germany", count: 67, flag: "🇩🇪" }
-    ]
+type ThreatLevelKey = "critical" | "high" | "medium" | "low"
+
+type ThreatLevels = Record<ThreatLevelKey, number>
+
+interface DashboardStats {
+  totalAttacks: number
+  uniqueIPs: number
+  threatsBlocked: number
+  scannersDetected: number
+  realTimeThreat: string | null
+  topScanners: Array<{ name: string; count: number; confidence: number }>
+  threatLevels: ThreatLevels
+  browserFingerprints: number
+  countries: Array<{ name: string; count: number; flag: string }>
+  countryCount: number
+}
+
+interface ScannerStatisticsRow {
+  scanner_type: string | null
+  threat_level: string | null
+  detection_count: number | null
+  avg_confidence: number | null
+}
+
+interface ThreatOverviewRow {
+  threat_level: string | null
+  total_threats: number | null
+}
+
+interface CountryOverviewRow {
+  country_code: string | null
+  country_name: string | null
+  attack_count: number | null
+}
+
+const THREAT_LEVEL_ORDER: ReadonlyArray<string> = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+const LEVEL_KEY_MAP: Record<string, ThreatLevelKey> = {
+  CRITICAL: "critical",
+  HIGH: "high",
+  MEDIUM: "medium",
+  LOW: "low",
+}
+
+const EMPTY_STATS: DashboardStats = {
+  totalAttacks: 0,
+  uniqueIPs: 0,
+  threatsBlocked: 0,
+  scannersDetected: 0,
+  realTimeThreat: null,
+  topScanners: [],
+  threatLevels: {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+  },
+  browserFingerprints: 0,
+  countries: [],
+  countryCount: 0,
+}
+
+const countryCodeToFlag = (code: string | null | undefined) => {
+  if (!code || code.length !== 2) {
+    return "🏳️"
   }
 
-  const getThreatColor = (level: string) => {
-    switch (level) {
-      case "CRITICAL": return "bg-red-500"
-      case "HIGH": return "bg-orange-500"
-      case "MEDIUM": return "bg-yellow-500"
-      case "LOW": return "bg-green-500"
-      default: return "bg-gray-500"
-    }
+  const base = 127397 // regional indicator symbol letter A
+  const characters = code
+    .toUpperCase()
+    .split("")
+    .map((char) => base + char.charCodeAt(0))
+
+  return String.fromCodePoint(...characters)
+}
+
+const normalizeThreatLevel = (value: string | null | undefined) =>
+  value ? value.toUpperCase() : null
+
+const getThreatColor = (level: string | null | undefined) => {
+  switch (normalizeThreatLevel(level)) {
+    case "CRITICAL":
+      return "bg-red-500"
+    case "HIGH":
+      return "bg-orange-500"
+    case "MEDIUM":
+      return "bg-yellow-500"
+    case "LOW":
+      return "bg-green-500"
+    default:
+      return "bg-gray-500"
   }
+}
+
+async function loadDashboardStats(): Promise<DashboardStats> {
+  const [
+    totalAttacksResult,
+    uniqueIpsResult,
+    scannerStatsResult,
+    threatOverviewResult,
+    countriesResult,
+    browserFingerprintsResult,
+    latestThreatResult,
+    countryCountResult,
+  ] = await Promise.all([
+    supabase
+      .from("attacker_logs")
+      .select<{ total: number }>("total:count()")
+      .maybeSingle(),
+    supabase
+      .from("attacker_logs")
+      .select<{ unique_ips: number }>("unique_ips:count(distinct source_ip)")
+      .maybeSingle(),
+    supabase
+      .from("v_scanner_statistics")
+      .select<ScannerStatisticsRow>(
+        "scanner_type, threat_level, detection_count, avg_confidence"
+      ),
+    supabase
+      .from("v_threat_overview")
+      .select<ThreatOverviewRow>("threat_level, total_threats"),
+    supabase
+      .from("v_attacks_by_country")
+      .select<CountryOverviewRow>("country_code, country_name, attack_count")
+      .order("attack_count", { ascending: false })
+      .limit(4),
+    supabase
+      .from("browser_fingerprints")
+      .select<{ total: number }>("total:count()")
+      .maybeSingle(),
+    supabase
+      .from("attacker_logs")
+      .select<{ threat_level: string | null }>("threat_level")
+      .not("threat_level", "is", "null")
+      .order("timestamp", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from("attacker_logs")
+      .select<{ countries: number }>("countries:count(distinct country_code)")
+      .not("country_code", "is", "null")
+      .maybeSingle(),
+  ])
+
+  const errors = [
+    totalAttacksResult.error,
+    uniqueIpsResult.error,
+    scannerStatsResult.error,
+    threatOverviewResult.error,
+    countriesResult.error,
+    browserFingerprintsResult.error,
+    latestThreatResult.error,
+    countryCountResult.error,
+  ].filter(Boolean)
+
+  if (errors.length) {
+    throw new Error(errors.map((err) => err?.message ?? "Unbekannter Fehler").join(" | "))
+  }
+
+  const threatLevels: ThreatLevels = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+  }
+
+  threatOverviewResult.data?.forEach((row) => {
+    const normalized = normalizeThreatLevel(row.threat_level ?? undefined)
+    if (!normalized) return
+
+    const key = LEVEL_KEY_MAP[normalized]
+    if (key) {
+      threatLevels[key] = row.total_threats ?? 0
+    }
+  })
+
+  const scannerMap = new Map<
+    string,
+    { name: string; count: number; confidenceSum: number; sampleCount: number }
+  >()
+
+  scannerStatsResult.data?.forEach((row) => {
+    const name = row.scanner_type ?? "Unbekannt"
+    const detectionCount = row.detection_count ?? 0
+    const avgConfidence = row.avg_confidence ?? 0
+
+    if (!scannerMap.has(name)) {
+      scannerMap.set(name, { name, count: 0, confidenceSum: 0, sampleCount: 0 })
+    }
+
+    const entry = scannerMap.get(name)!
+    entry.count += detectionCount
+    entry.confidenceSum += avgConfidence * detectionCount
+    entry.sampleCount += detectionCount
+  })
+
+  const scannerEntries = Array.from(scannerMap.values())
+  const topScanners = scannerEntries
+    .map((entry) => {
+      const confidence = entry.sampleCount > 0 ? entry.confidenceSum / entry.sampleCount : 0
+      return {
+        name: entry.name,
+        count: entry.count,
+        confidence: Math.max(0, Math.min(confidence, 1)),
+      }
+    })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 4)
+
+  const countries = (countriesResult.data ?? []).map((row) => ({
+    name: row.country_name ?? "Unbekannt",
+    count: row.attack_count ?? 0,
+    flag: countryCodeToFlag(row.country_code),
+  }))
+
+  const latestThreat = normalizeThreatLevel(latestThreatResult.data?.threat_level ?? undefined)
+  const fallbackThreat = THREAT_LEVEL_ORDER.find((level) => {
+    const key = LEVEL_KEY_MAP[level]
+    return key ? threatLevels[key] > 0 : false
+  })
+
+  const threatsBlocked = threatLevels.critical + threatLevels.high
+
+  return {
+    totalAttacks: totalAttacksResult.data?.total ?? 0,
+    uniqueIPs: uniqueIpsResult.data?.unique_ips ?? 0,
+    threatsBlocked,
+    scannersDetected: scannerEntries.length,
+    realTimeThreat: latestThreat ?? fallbackThreat ?? null,
+    topScanners,
+    threatLevels,
+    browserFingerprints: browserFingerprintsResult.data?.total ?? 0,
+    countries,
+    countryCount: countryCountResult.data?.countries ?? countries.length,
+  }
+}
+
+export default function Page() {
+  const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    const fetchStats = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const data = await loadDashboardStats()
+        if (active) {
+          setStats(data)
+        }
+      } catch (err) {
+        console.error("Fehler beim Laden der Dashboard-Daten", err)
+        if (active) {
+          setError("Dashboard-Daten konnten nicht geladen werden. Bitte versuche es später erneut.")
+          setStats(EMPTY_STATS)
+        }
+      } finally {
+        if (active) {
+          setLoading(false)
+        }
+      }
+    }
+
+    fetchStats()
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const threatBadgeLabel = stats.realTimeThreat ?? "UNKNOWN"
+  const topScannerNames = useMemo(() => {
+    if (!stats.topScanners.length) return "Keine Scanner erkannt"
+    return stats.topScanners
+      .slice(0, 3)
+      .map((scanner) => scanner.name)
+      .join(", ")
+  }, [stats.topScanners])
 
   return (
     <SidebarProvider>
@@ -107,10 +356,17 @@ export default function Page() {
                 <p className="text-sm opacity-90">Real-time Scanner Detection & Browser Fingerprinting</p>
               </div>
             </div>
-            <Badge className={`${getThreatColor(mockData.realTimeThreat)} text-white px-3 py-1`}>
-              THREAT LEVEL: {mockData.realTimeThreat}
+            <Badge className={`${getThreatColor(threatBadgeLabel)} text-white px-3 py-1 flex items-center gap-2`}>
+              {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+              THREAT LEVEL: {threatBadgeLabel}
             </Badge>
           </div>
+
+          {error && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+              {error}
+            </div>
+          )}
 
           {/* Key Metrics Grid */}
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -120,10 +376,16 @@ export default function Page() {
                 <Activity className="h-4 w-4 text-muted-foreground" />
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.totalAttacks.toLocaleString()}</div>
-                <p className="text-xs text-muted-foreground">
-                  <TrendingUp className="inline h-3 w-3 mr-1" />
-                  +12.5% from last hour
+                {loading ? (
+                  <Skeleton className="h-8 w-24" />
+                ) : (
+                  <div className="text-2xl font-bold">{stats.totalAttacks.toLocaleString()}</div>
+                )}
+                <p className="text-xs text-muted-foreground mt-2 flex items-center gap-1">
+                  <TrendingUp className="h-3 w-3" />
+                  {loading
+                    ? "Berechnung läuft..."
+                    : `${stats.threatsBlocked} High/Critical threats blocked`}
                 </p>
               </CardContent>
             </Card>
@@ -134,10 +396,18 @@ export default function Page() {
                 <Users className="h-4 w-4 text-muted-foreground" />
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.uniqueIPs}</div>
-                <p className="text-xs text-muted-foreground">
-                  <Globe className="inline h-3 w-3 mr-1" />
-                  From 23 countries
+                {loading ? (
+                  <Skeleton className="h-8 w-16" />
+                ) : (
+                  <div className="text-2xl font-bold">{stats.uniqueIPs}</div>
+                )}
+                <p className="text-xs text-muted-foreground mt-2 flex items-center gap-1">
+                  <Globe className="h-3 w-3" />
+                  {loading
+                    ? "Ermittle Regionen..."
+                    : stats.countryCount > 0
+                      ? `From ${stats.countryCount} countries`
+                      : "Keine Geodaten"}
                 </p>
               </CardContent>
             </Card>
@@ -148,10 +418,14 @@ export default function Page() {
                 <Scan className="h-4 w-4 text-muted-foreground" />
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.scannersDetected}</div>
-                <p className="text-xs text-muted-foreground">
-                  <Bot className="inline h-3 w-3 mr-1" />
-                  Nmap, Masscan, Gobuster
+                {loading ? (
+                  <Skeleton className="h-8 w-16" />
+                ) : (
+                  <div className="text-2xl font-bold">{stats.scannersDetected}</div>
+                )}
+                <p className="text-xs text-muted-foreground mt-2 flex items-center gap-1">
+                  <Bot className="h-3 w-3" />
+                  {loading ? "Scanner werden geladen..." : topScannerNames}
                 </p>
               </CardContent>
             </Card>
@@ -162,10 +436,14 @@ export default function Page() {
                 <Fingerprint className="h-4 w-4 text-muted-foreground" />
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.browserFingerprints}</div>
-                <p className="text-xs text-muted-foreground">
-                  <Monitor className="inline h-3 w-3 mr-1" />
-                  Canvas, WebGL, Audio
+                {loading ? (
+                  <Skeleton className="h-8 w-20" />
+                ) : (
+                  <div className="text-2xl font-bold">{stats.browserFingerprints}</div>
+                )}
+                <p className="text-xs text-muted-foreground mt-2 flex items-center gap-1">
+                  <Monitor className="h-3 w-3" />
+                  {loading ? "Synchronisiere Fingerprints..." : "Canvas, WebGL, Audio"}
                 </p>
               </CardContent>
             </Card>
@@ -186,21 +464,38 @@ export default function Page() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {mockData.topScanners.map((scanner, index) => (
-                  <div key={scanner.name} className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
-                    <div className="flex items-center gap-3">
-                      <Badge variant="outline">#{index + 1}</Badge>
-                      <div>
-                        <p className="font-medium">{scanner.name}</p>
-                        <p className="text-sm text-muted-foreground">{scanner.count} detections</p>
+                {loading ? (
+                  Array.from({ length: 4 }).map((_, index) => (
+                    <div key={index} className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                      <div className="flex items-center gap-3">
+                        <Skeleton className="h-6 w-12" />
+                        <div className="space-y-1">
+                          <Skeleton className="h-4 w-32" />
+                          <Skeleton className="h-3 w-20" />
+                        </div>
+                      </div>
+                      <Skeleton className="h-3 w-24" />
+                    </div>
+                  ))
+                ) : stats.topScanners.length ? (
+                  stats.topScanners.map((scanner, index) => (
+                    <div key={scanner.name} className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                      <div className="flex items-center gap-3">
+                        <Badge variant="outline">#{index + 1}</Badge>
+                        <div>
+                          <p className="font-medium">{scanner.name}</p>
+                          <p className="text-sm text-muted-foreground">{scanner.count} detections</p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-sm font-medium">{(scanner.confidence * 100).toFixed(1)}%</p>
+                        <Progress value={scanner.confidence * 100} className="w-20" />
                       </div>
                     </div>
-                    <div className="text-right">
-                      <p className="text-sm font-medium">{(scanner.confidence * 100).toFixed(1)}%</p>
-                      <Progress value={scanner.confidence * 100} className="w-20" />
-                    </div>
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <p className="text-sm text-muted-foreground">Keine Scanner-Daten verfügbar.</p>
+                )}
               </CardContent>
             </Card>
 
@@ -216,34 +511,24 @@ export default function Page() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-2">
-                    <div className="w-3 h-3 bg-red-500 rounded-full"></div>
-                    Critical
-                  </span>
-                  <Badge variant="destructive">{mockData.threatLevels.critical}</Badge>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-2">
-                    <div className="w-3 h-3 bg-orange-500 rounded-full"></div>
-                    High
-                  </span>
-                  <Badge variant="secondary">{mockData.threatLevels.high}</Badge>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-2">
-                    <div className="w-3 h-3 bg-yellow-500 rounded-full"></div>
-                    Medium
-                  </span>
-                  <Badge variant="outline">{mockData.threatLevels.medium}</Badge>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-2">
-                    <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                    Low
-                  </span>
-                  <Badge variant="outline">{mockData.threatLevels.low}</Badge>
-                </div>
+                {[
+                  { label: "Critical", color: "bg-red-500", value: stats.threatLevels.critical, badge: "destructive" as const },
+                  { label: "High", color: "bg-orange-500", value: stats.threatLevels.high, badge: "secondary" as const },
+                  { label: "Medium", color: "bg-yellow-500", value: stats.threatLevels.medium, badge: "outline" as const },
+                  { label: "Low", color: "bg-green-500", value: stats.threatLevels.low, badge: "outline" as const },
+                ].map((item) => (
+                  <div key={item.label} className="flex items-center justify-between">
+                    <span className="flex items-center gap-2">
+                      <div className={`w-3 h-3 rounded-full ${item.color}`}></div>
+                      {item.label}
+                    </span>
+                    {loading ? (
+                      <Skeleton className="h-6 w-10" />
+                    ) : (
+                      <Badge variant={item.badge}>{item.value}</Badge>
+                    )}
+                  </div>
+                ))}
               </CardContent>
             </Card>
 
@@ -259,15 +544,29 @@ export default function Page() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
-                {mockData.countries.map((country, index) => (
-                  <div key={country.name} className="flex items-center justify-between">
-                    <span className="flex items-center gap-2">
-                      <span className="text-lg">{country.flag}</span>
-                      {country.name}
-                    </span>
-                    <Badge variant="outline">{country.count}</Badge>
-                  </div>
-                ))}
+                {loading ? (
+                  Array.from({ length: 4 }).map((_, index) => (
+                    <div key={index} className="flex items-center justify-between">
+                      <span className="flex items-center gap-2">
+                        <Skeleton className="h-6 w-6" />
+                        <Skeleton className="h-4 w-24" />
+                      </span>
+                      <Skeleton className="h-6 w-12" />
+                    </div>
+                  ))
+                ) : stats.countries.length ? (
+                  stats.countries.map((country) => (
+                    <div key={`${country.name}-${country.flag}`} className="flex items-center justify-between">
+                      <span className="flex items-center gap-2">
+                        <span className="text-lg">{country.flag}</span>
+                        {country.name}
+                      </span>
+                      <Badge variant="outline">{country.count}</Badge>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-sm text-muted-foreground">Keine Geo-Daten verfügbar.</p>
+                )}
               </CardContent>
             </Card>
 
