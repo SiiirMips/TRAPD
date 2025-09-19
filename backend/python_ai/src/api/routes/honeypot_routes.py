@@ -1,6 +1,7 @@
 """Honeypot analysis and disinformation routes with hardened security defaults."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -71,6 +72,7 @@ def _load_api_keys() -> List[str]:
 MAX_REQUEST_BODY_BYTES = _parse_positive_int("MAX_REQUEST_BODY_BYTES", 65_536)
 MAX_INTERACTION_DATA_BYTES = _parse_positive_int("MAX_INTERACTION_DATA_BYTES", 16_384)
 MAX_GEO_LOCATION_BYTES = _parse_positive_int("MAX_GEO_LOCATION_BYTES", 4_096)
+GEMINI_API_TIMEOUT_SECONDS = _parse_positive_int("GEMINI_API_TIMEOUT_SECONDS", 30)
 MAX_LOG_FIELD_LENGTH = 256
 MAX_LOG_LIST_ITEMS = 10
 SENSITIVE_KEYS = {"password", "pass", "pwd", "secret", "token", "authorization", "api_key"}
@@ -249,13 +251,22 @@ async def call_gemini_api(prompt_text: str) -> str:
 
     logger.debug("[Gemini API] Sending prompt (%s characters)…", len(prompt_text))
     try:
-        response = await gemini_model.generate_content_async(prompt_text)
+        response = await asyncio.wait_for(
+            gemini_model.generate_content_async(prompt_text),
+            timeout=GEMINI_API_TIMEOUT_SECONDS,
+        )
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
             generated_text = response.candidates[0].content.parts[0].text
             logger.debug("[Gemini API] Antwort erhalten: %s…", generated_text[:100])
             return generated_text
         logger.warning("[Gemini API] Leere oder unerwartete Antwort: %s", response)
         return "Fehler: KI konnte keine plausible Desinformation generieren."
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            "[Gemini API] Timeout nach %s Sekunden – Anfrage wurde abgebrochen.",
+            GEMINI_API_TIMEOUT_SECONDS,
+        )
+        raise RuntimeError("Gemini-API-Antwort hat das Sicherheitszeitlimit überschritten.") from exc
     except Exception as exc:
         logger.exception("[Gemini API] Fehler beim Aufruf der Gemini API: %s", exc)
         raise

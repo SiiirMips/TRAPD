@@ -9,7 +9,7 @@ keeping the application configurable via environment variables.
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import Dict, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -20,6 +20,20 @@ import uvicorn
 
 # Lade Umgebungsvariablen so früh wie möglich ein.
 load_dotenv()
+
+
+DEFAULT_SECURITY_HEADERS: Dict[str, str] = {
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=()",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+}
 
 
 def _split_env_list(env_name: str, fallback: str = "") -> List[str]:
@@ -63,7 +77,27 @@ def create_app() -> FastAPI:
     if _env_flag("APP_ENFORCE_HTTPS", "0"):
         app.add_middleware(HTTPSRedirectMiddleware)
 
-    from api.routes.honeypot_routes import router as honeypot_router
+    if not _env_flag("APP_DISABLE_SECURITY_HEADERS", "0"):
+        configured_headers = dict(DEFAULT_SECURITY_HEADERS)
+
+        custom_csp = os.getenv("APP_CONTENT_SECURITY_POLICY")
+        if custom_csp:
+            configured_headers["Content-Security-Policy"] = custom_csp
+
+        @app.middleware("http")
+        async def apply_security_headers(request, call_next):
+            response = await call_next(request)
+            # Prevent server disclosure unless explicitly configured downstream.
+            if "server" in response.headers:
+                del response.headers["server"]
+            for header, value in configured_headers.items():
+                response.headers.setdefault(header, value)
+            return response
+
+    try:
+        from .api.routes.honeypot_routes import router as honeypot_router
+    except ImportError:  # pragma: no cover - fallback for legacy execution styles
+        from api.routes.honeypot_routes import router as honeypot_router
 
     app.include_router(honeypot_router, prefix="/analyze")
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+from starlette.testclient import TestClient
 
 # Stub google modules so the honeypot routes can be imported without optional dependencies.
 google_module = types.ModuleType("google")
@@ -16,6 +17,7 @@ sys.modules["google"] = google_module
 os.environ.setdefault("SUPABASE_LOCAL_URL", "http://127.0.0.1:54321")
 os.environ.setdefault("SUPABASE_LOCAL_SERVICE_ROLE_KEY", "test-service-role-key")
 os.environ.setdefault("API_AUTH_KEYS", "unit-test-key")
+os.environ.setdefault("APP_ALLOWED_HOSTS", "127.0.0.1,localhost,testserver")
 
 
 generativeai_module = types.ModuleType("google.generativeai")
@@ -111,6 +113,7 @@ from backend.python_ai.src.api.routes.honeypot_routes import (  # noqa: E402
     sanitize_for_logging,
     verify_api_key,
 )
+from backend.python_ai.src.main import DEFAULT_SECURITY_HEADERS, create_app  # noqa: E402
 
 
 def test_identify_attack_indicators_http_directory_traversal_and_scanner():
@@ -200,3 +203,16 @@ def test_honeypot_log_rejects_oversized_interaction_data():
             honeypot_type="http",
             interaction_data={"payload": oversized_value},
         )
+
+
+def test_app_applies_security_headers_and_strips_server_header():
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    for header_name, expected_value in DEFAULT_SECURITY_HEADERS.items():
+        assert response.headers.get(header_name) == expected_value
+
+    lower_case_headers = {key.lower() for key in response.headers.keys()}
+    assert "server" not in lower_case_headers
