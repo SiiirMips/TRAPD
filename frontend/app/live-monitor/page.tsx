@@ -22,6 +22,8 @@ import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { DisinformationList } from "@/components/disinformation/disinformation-list"
+import type { DisinformationEntry } from "@/components/disinformation/types"
 import {
   Activity,
   Shield,
@@ -40,6 +42,8 @@ import type { RealtimeChannel, RealtimePostgresInsertPayload } from "@supabase/s
 
 const ACTIVE_WINDOW_MINUTES = 15
 const MAX_STORED_EVENTS = 200
+const MAX_STORED_DISINFORMATION = 60
+const LOG_MATCH_WINDOW_MS = 5 * 60 * 1000
 
 const severityLabelMap = {
   critical: "Critical",
@@ -369,6 +373,252 @@ function severityVariant(severity: Severity): "destructive" | "default" | "secon
   return "secondary"
 }
 
+const LOG_ID_CANDIDATE_KEYS = [
+  "log_id",
+  "attacker_log_id",
+  "original_log_id",
+  "source_log_id",
+  "related_log_id",
+  "attacker_log_uuid"
+] as const
+
+function normalizeGeneratedByAI(value: unknown): boolean {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase()
+    if (["true", "1", "yes"].includes(normalized)) return true
+    if (["false", "0", "no"].includes(normalized)) return false
+  }
+  if (typeof value === "number") return value !== 0
+  if (value === null || typeof value === "undefined") return true
+  return Boolean(value)
+}
+
+function extractLogIdsFromContext(context: GenericRecord | null): string[] {
+  if (!context) return []
+  const identifiers = new Set<string>()
+
+  for (const key of LOG_ID_CANDIDATE_KEYS) {
+    const candidate = getStringField(context, key)
+    if (candidate) {
+      identifiers.add(candidate)
+    }
+  }
+
+  const metadata = ensureRecord(context["metadata"])
+  if (metadata) {
+    for (const key of LOG_ID_CANDIDATE_KEYS) {
+      const candidate = getStringField(metadata, key)
+      if (candidate) {
+        identifiers.add(candidate)
+      }
+    }
+  }
+
+  const related = ensureRecord(context["related_log"])
+  if (related) {
+    const candidate = getStringField(related, "id") ?? getStringField(related, "log_id")
+    if (candidate) {
+      identifiers.add(candidate)
+    }
+  }
+
+  const relatedLogs = context["related_logs"]
+  if (Array.isArray(relatedLogs)) {
+    for (const entry of relatedLogs) {
+      if (typeof entry === "string") {
+        identifiers.add(entry)
+      } else {
+        const record = ensureRecord(entry)
+        if (record) {
+          const candidate = getStringField(record, "id") ?? getStringField(record, "log_id")
+          if (candidate) {
+            identifiers.add(candidate)
+          }
+        }
+      }
+    }
+  }
+
+  return Array.from(identifiers)
+}
+
+function parseAnalysisRulesFromContext(context: GenericRecord | null): string[] {
+  if (!context) return []
+  const rawRules = context["analysis_rules_triggered"]
+  if (!rawRules) return []
+
+  const toStringValue = (value: unknown): string | null => {
+    if (typeof value === "string") return value
+    if (typeof value === "number") return value.toString()
+    if (value && typeof value === "object") {
+      try {
+        return JSON.stringify(value)
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+
+  if (Array.isArray(rawRules)) {
+    return rawRules
+      .map(toStringValue)
+      .filter((value): value is string => Boolean(value && value.trim()))
+      .map(value => value.trim())
+  }
+
+  if (typeof rawRules === "string") {
+    try {
+      const parsed = JSON.parse(rawRules) as unknown
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map(toStringValue)
+          .filter((value): value is string => Boolean(value && value.trim()))
+          .map(value => value.trim())
+      }
+    } catch {
+      if (rawRules.trim()) {
+        return [rawRules.trim()]
+      }
+    }
+    if (rawRules.trim()) {
+      return [rawRules.trim()]
+    }
+  }
+
+  return []
+}
+
+function resolveRelatedLogId(
+  sourceIp: string | undefined,
+  generatedTimestamp: string | undefined,
+  honeypotType: string | undefined,
+  attacks: AttackEvent[],
+  directIds: string[]
+): string | null {
+  for (const identifier of directIds) {
+    if (attacks.some(attack => attack.id === identifier)) {
+      return identifier
+    }
+  }
+
+  if (directIds.length > 0) {
+    return directIds[0]
+  }
+
+  if (!sourceIp) {
+    return null
+  }
+
+  const normalizedIp = sourceIp.trim()
+  if (!normalizedIp) {
+    return null
+  }
+
+  const normalizedHoneypot = honeypotType ? honeypotType.toLowerCase() : undefined
+
+  const matchingAttacks = attacks.filter(attack => {
+    if (attack.ip !== normalizedIp) {
+      return false
+    }
+    if (!normalizedHoneypot) {
+      return true
+    }
+    return attack.type.toLowerCase().includes(normalizedHoneypot)
+  })
+
+  if (matchingAttacks.length === 0) {
+    return null
+  }
+
+  if (generatedTimestamp) {
+    const targetTime = Date.parse(generatedTimestamp)
+    if (!Number.isNaN(targetTime)) {
+      let closest: AttackEvent | null = null
+      let smallestDiff = Number.POSITIVE_INFINITY
+      for (const attack of matchingAttacks) {
+        const attackTime = Date.parse(attack.timestamp)
+        if (Number.isNaN(attackTime)) {
+          continue
+        }
+        const diff = Math.abs(attackTime - targetTime)
+        if (diff < smallestDiff) {
+          smallestDiff = diff
+          closest = attack
+        }
+      }
+      if (closest && smallestDiff <= LOG_MATCH_WINDOW_MS) {
+        return closest.id
+      }
+    }
+  }
+
+  return matchingAttacks[0]?.id ?? null
+}
+
+function normalizeDisinformationRecord(
+  raw: GenericRecord,
+  attacks: AttackEvent[]
+): DisinformationEntry | null {
+  const id = getStringField(raw, "id")
+  const content = getStringField(raw, "content")
+  if (!id || !content) {
+    return null
+  }
+
+  const timestampValue = getStringField(raw, "creation_timestamp")
+    ?? getStringField(raw, "created_at")
+    ?? getStringField(raw, "inserted_at")
+
+  const createdAt = (() => {
+    if (timestampValue) {
+      const parsed = Date.parse(timestampValue)
+      if (!Number.isNaN(parsed)) {
+        return new Date(parsed).toISOString()
+      }
+    }
+    return new Date().toISOString()
+  })()
+
+  const contentType = getStringField(raw, "content_type") ?? "text/plain"
+  const aiModel = getStringField(raw, "ai_model") ?? undefined
+  const generatedByAI = normalizeGeneratedByAI(raw["generated_by_ai"])
+
+  const targetContext = ensureRecord(raw["target_context"])
+  const sourceIp = targetContext ? getStringField(targetContext, "source_ip") : undefined
+  const generatedTimestamp = targetContext ? getStringField(targetContext, "generated_timestamp") : undefined
+  const honeypotType = targetContext ? getStringField(targetContext, "honeypot_type") : undefined
+  const analysisTriggeredBy = targetContext ? getStringField(targetContext, "analysis_triggered_by") : undefined
+  const analysisRules = parseAnalysisRulesFromContext(targetContext)
+  const contextLogIds = extractLogIdsFromContext(targetContext)
+
+  const relatedLogId = resolveRelatedLogId(
+    sourceIp,
+    generatedTimestamp,
+    honeypotType,
+    attacks,
+    contextLogIds
+  )
+
+  return {
+    id,
+    createdAt,
+    content,
+    contentType,
+    aiModel,
+    generatedByAI,
+    targetContext,
+    relatedLogId,
+    sourceIp: sourceIp ?? undefined,
+    generatedTimestamp: generatedTimestamp ?? undefined,
+    honeypotType: honeypotType ?? undefined,
+    analysisTriggeredBy: analysisTriggeredBy ?? undefined,
+    analysisRules: analysisRules.length > 0 ? analysisRules : undefined,
+    contextLogIds
+  }
+}
+
 export default function Page() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -389,10 +639,12 @@ export default function Page() {
     low: 0
   })
   const [highSeveritySamples, setHighSeveritySamples] = useState<string[]>([])
+  const [disinformationEntries, setDisinformationEntries] = useState<DisinformationEntry[]>([])
   const [isConnected, setIsConnected] = useState(false)
 
   const isMountedRef = useRef(false)
   const channelRef = useRef<RealtimeChannel | null>(null)
+  const disinformationChannelRef = useRef<RealtimeChannel | null>(null)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const lastHeartbeatRef = useRef<number>(Date.now())
@@ -406,6 +658,13 @@ export default function Page() {
     }
   }, [])
 
+  const updateDisinformationEntries = useCallback((updater: (prev: DisinformationEntry[]) => DisinformationEntry[]) => {
+    setDisinformationEntries(prev => {
+      const next = updater(prev)
+      return next === prev ? prev : next
+    })
+  }, [])
+
   const updateHoneypotStatus = useCallback((status: ThreatData["honeypotStatus"]) => {
     if (!isMountedRef.current) return
     setThreatData(prev => (
@@ -414,6 +673,42 @@ export default function Page() {
         : { ...prev, honeypotStatus: status }
     ))
   }, [])
+
+  const processDisinformationRecords = useCallback(
+    (records: GenericRecord[], attacks: AttackEvent[]): DisinformationEntry[] => {
+      return records
+        .map(item => normalizeDisinformationRecord(item, attacks))
+        .filter((entry): entry is DisinformationEntry => Boolean(entry))
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    },
+    []
+  )
+
+  const fetchDisinformationEntries = useCallback(async () => {
+    try {
+      const response = await supabase
+        .from("disinformation_content")
+        .select("*")
+        .order("creation_timestamp", { ascending: false })
+        .limit(MAX_STORED_DISINFORMATION)
+
+      if (response.error) {
+        console.error("Failed to load disinformation content", response.error)
+        return
+      }
+
+      const processed = processDisinformationRecords(
+        (response.data ?? []) as GenericRecord[],
+        allAttacksRef.current
+      )
+
+      if (!isMountedRef.current) return
+
+      updateDisinformationEntries(() => processed.slice(0, MAX_STORED_DISINFORMATION))
+    } catch (error) {
+      console.error("Unexpected error while loading disinformation content", error)
+    }
+  }, [processDisinformationRecords, updateDisinformationEntries])
 
   const applyAttackData = useCallback((attacks: AttackEvent[], totalCount: number, lastTimestamp?: string) => {
     if (!isMountedRef.current) return
@@ -440,6 +735,32 @@ export default function Page() {
       connectedAttackers: uniqueIps.size
     }))
 
+    updateDisinformationEntries(prev => {
+      if (prev.length === 0) {
+        return prev
+      }
+
+      let changed = false
+      const updated = prev.map(entry => {
+        const resolved = resolveRelatedLogId(
+          entry.sourceIp,
+          entry.generatedTimestamp,
+          entry.honeypotType,
+          sortedAttacks,
+          entry.contextLogIds
+        )
+
+        if (resolved === entry.relatedLogId) {
+          return entry
+        }
+
+        changed = true
+        return { ...entry, relatedLogId: resolved }
+      })
+
+      return changed ? updated : prev
+    })
+
     const candidateTimestamp = lastTimestamp ?? sortedAttacks[0]?.timestamp
     if (candidateTimestamp) {
       const parsed = Date.parse(candidateTimestamp)
@@ -447,7 +768,7 @@ export default function Page() {
     } else {
       setLastUpdate(new Date())
     }
-  }, [])
+  }, [updateDisinformationEntries])
 
   const fetchLatestData = useCallback(async () => {
     try {
@@ -489,11 +810,11 @@ export default function Page() {
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true)
     try {
-      await fetchLatestData()
+      await Promise.all([fetchLatestData(), fetchDisinformationEntries()])
     } finally {
       setIsRefreshing(false)
     }
-  }, [fetchLatestData])
+  }, [fetchLatestData, fetchDisinformationEntries])
 
   useEffect(() => {
     let cancelled = false
@@ -647,6 +968,68 @@ export default function Page() {
     }
   }, [applyAttackData, fetchLatestData, updateHoneypotStatus])
 
+  useEffect(() => {
+    let cancelled = false
+
+    const ingestRecord = (record: GenericRecord) => {
+      const normalized = processDisinformationRecords([record], allAttacksRef.current)
+      if (normalized.length === 0) return
+      const [entry] = normalized
+
+      updateDisinformationEntries(prev => {
+        const existingIndex = prev.findIndex(item => item.id === entry.id)
+        if (existingIndex >= 0) {
+          const next = prev.slice()
+          next[existingIndex] = entry
+          next.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+          return next
+        }
+
+        const next = [entry, ...prev]
+        next.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        return next.slice(0, MAX_STORED_DISINFORMATION)
+      })
+    }
+
+    void fetchDisinformationEntries()
+
+    if (disinformationChannelRef.current) {
+      supabase.removeChannel(disinformationChannelRef.current)
+      disinformationChannelRef.current = null
+    }
+
+    const channel = supabase.channel("public:disinformation_content")
+    disinformationChannelRef.current = channel
+
+    channel.on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "disinformation_content" },
+      (payload: RealtimePostgresInsertPayload<GenericRecord>) => {
+        if (cancelled || !isMountedRef.current) return
+        ingestRecord(payload.new)
+      }
+    )
+
+    channel.on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "disinformation_content" },
+      (payload: RealtimePostgresInsertPayload<GenericRecord>) => {
+        if (cancelled || !isMountedRef.current) return
+        ingestRecord(payload.new)
+      }
+    )
+
+    channel.subscribe()
+
+    return () => {
+      cancelled = true
+      if (disinformationChannelRef.current) {
+        supabase.removeChannel(disinformationChannelRef.current)
+        disinformationChannelRef.current = null
+      }
+    }
+  }, [fetchDisinformationEntries, processDisinformationRecords, updateDisinformationEntries])
+
   const connectionLabel = isConnected
     ? "Live"
     : threatData.honeypotStatus === "reconnecting"
@@ -777,7 +1160,11 @@ export default function Page() {
                 <ScrollArea className="h-[400px]">
                   <div className="space-y-3">
                     {recentAttacks.length > 0 ? recentAttacks.map((attack) => (
-                      <div key={attack.id} className="flex items-center justify-between p-3 border rounded-lg hover:bg-muted/50 transition-colors">
+                      <div
+                        id={`attack-${attack.id}`}
+                        key={attack.id}
+                        className="flex items-center justify-between p-3 border rounded-lg hover:bg-muted/50 transition-colors scroll-mt-24"
+                      >
                         <div className="flex items-center gap-3">
                           <Badge variant={severityVariant(attack.severity)}>
                             {severityLabelMap[attack.severity]}
@@ -842,11 +1229,12 @@ export default function Page() {
           <Card>
             <CardContent className="p-6">
               <Tabs defaultValue="network" className="w-full">
-                <TabsList className="grid w-full grid-cols-4">
+                <TabsList className="grid w-full grid-cols-5">
                   <TabsTrigger value="network">Network Activity</TabsTrigger>
                   <TabsTrigger value="protocols">Protocols</TabsTrigger>
                   <TabsTrigger value="payloads">Payloads</TabsTrigger>
                   <TabsTrigger value="timeline">Timeline</TabsTrigger>
+                  <TabsTrigger value="disinformation">Disinformation</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="network" className="mt-4">
@@ -930,6 +1318,10 @@ export default function Page() {
                       <p className="text-sm text-muted-foreground text-center py-6">Timeline will populate as events arrive.</p>
                     )}
                   </div>
+                </TabsContent>
+
+                <TabsContent value="disinformation" className="mt-4">
+                  <DisinformationList entries={disinformationEntries} />
                 </TabsContent>
               </Tabs>
             </CardContent>
