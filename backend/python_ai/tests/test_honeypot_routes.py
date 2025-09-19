@@ -1,11 +1,21 @@
+import asyncio
+import os
 import sys
 import types
 from pathlib import Path
+
+import pytest
+from fastapi import HTTPException
+from pydantic import ValidationError
 
 # Stub google modules so the honeypot routes can be imported without optional dependencies.
 google_module = types.ModuleType("google")
 google_module.__path__ = []  # mark as package
 sys.modules["google"] = google_module
+
+os.environ.setdefault("SUPABASE_LOCAL_URL", "http://127.0.0.1:54321")
+os.environ.setdefault("SUPABASE_LOCAL_SERVICE_ROLE_KEY", "test-service-role-key")
+os.environ.setdefault("API_AUTH_KEYS", "unit-test-key")
 
 
 generativeai_module = types.ModuleType("google.generativeai")
@@ -95,8 +105,11 @@ sys.modules["supabase"] = supabase_module
 
 
 from backend.python_ai.src.api.routes.honeypot_routes import (  # noqa: E402
+    MAX_INTERACTION_DATA_BYTES,
     HoneypotLog,
     identify_attack_indicators,
+    sanitize_for_logging,
+    verify_api_key,
 )
 
 
@@ -153,3 +166,37 @@ def test_identify_attack_indicators_ssh_bruteforce_and_scanner():
 
     assert "SSH-Bruteforce" in indicators
     assert "Known Scanner" in indicators
+
+
+def test_verify_api_key_accepts_valid_key():
+    assert asyncio.run(verify_api_key(api_key="unit-test-key")) == "unit-test-key"
+
+
+def test_verify_api_key_rejects_invalid_key():
+    with pytest.raises(HTTPException):
+        asyncio.run(verify_api_key(api_key="invalid-key"))
+
+
+def test_sanitize_for_logging_masks_sensitive_fields():
+    payload = {
+        "password": "secret",
+        "nested": {"token": "abc", "value": "ok"},
+        "list": ["keep", {"pass": "hidden"}],
+    }
+
+    sanitized = sanitize_for_logging(payload)
+
+    assert sanitized["password"] == "***redacted***"
+    assert sanitized["nested"]["token"] == "***redacted***"
+    assert sanitized["list"][1]["pass"] == "***redacted***"
+
+
+def test_honeypot_log_rejects_oversized_interaction_data():
+    oversized_value = "x" * (MAX_INTERACTION_DATA_BYTES + 1)
+
+    with pytest.raises(ValidationError):
+        HoneypotLog(
+            source_ip="1.1.1.1",
+            honeypot_type="http",
+            interaction_data={"payload": oversized_value},
+        )

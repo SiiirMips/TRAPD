@@ -1,101 +1,268 @@
-# backend/python_ai/src/api/routes/honeypot_routes.py
-from fastapi import APIRouter, Request, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from datetime import datetime
-from typing import Dict, Any, Optional, Tuple, List
-from urllib.parse import unquote
+"""Honeypot analysis and disinformation routes with hardened security defaults."""
+from __future__ import annotations
 
-import os
 import json
+import logging
+import os
+import secrets
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
+
 import google.generativeai as genai
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, InternalServerError
+from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
+from fastapi.security import APIKeyHeader
+from google.api_core.exceptions import InternalServerError, ResourceExhausted, ServiceUnavailable
+from pydantic import BaseModel, Field, IPvAnyAddress, validator
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from supabase import Client, create_client
 
 
-# Supabase Client Initialisierung
-from supabase import create_client, Client
-
-supabase_url: str = os.getenv("SUPABASE_LOCAL_URL", "http://127.0.0.1:54321")
-supabase_key: str = os.getenv("SUPABASE_LOCAL_SERVICE_ROLE_KEY", "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE") # Placeholder, should be from .env
-
-if "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE" in supabase_key:
-    print("WARNUNG: SUPABASE_LOCAL_SERVICE_ROLE_KEY ist noch der Platzhalter. Bitte in .env setzen!")
-
-supabase_client: Client = create_client(supabase_url, supabase_key)
+logger = logging.getLogger("backend.python_ai.api.honeypot_routes")
 
 
-# Gemini API Konfiguration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("FEHLER: GEMINI_API_KEY ist nicht gesetzt. KI-Generierung wird fehlschlagen!")
-else:
-    genai.configure(api_key=GEMINI_API_KEY)
+def _parse_positive_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable '{name}' must be an integer.") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"Environment variable '{name}' must be a positive integer.")
+    return parsed
 
-# Initialisiere das Gemini Modell
-gemini_model = None # Initialisiere als None
+
+def _validate_supabase_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("Supabase URL must include scheme and host (http(s)://host[:port]).")
+    return url
+
+
+def _resolve_supabase_url() -> str:
+    for env_name in ("SUPABASE_URL", "SUPABASE_LOCAL_URL"):
+        value = os.getenv(env_name)
+        if value:
+            return _validate_supabase_url(value)
+    raise RuntimeError("SUPABASE_URL or SUPABASE_LOCAL_URL must be configured.")
+
+
+def _resolve_supabase_service_role_key() -> str:
+    for env_name in ("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_LOCAL_SERVICE_ROLE_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            if "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE" in value:
+                raise RuntimeError("Supabase service role key placeholder detected; configure a secure key.")
+            return value
+    raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_LOCAL_SERVICE_ROLE_KEY must be configured.")
+
+
+def _load_api_keys() -> List[str]:
+    raw = os.getenv("API_AUTH_KEYS", "")
+    keys = [item.strip() for item in raw.split(",") if item.strip()]
+    if not keys:
+        raise RuntimeError("API_AUTH_KEYS must contain at least one API key for authentication.")
+    return keys
+
+
+MAX_REQUEST_BODY_BYTES = _parse_positive_int("MAX_REQUEST_BODY_BYTES", 65_536)
+MAX_INTERACTION_DATA_BYTES = _parse_positive_int("MAX_INTERACTION_DATA_BYTES", 16_384)
+MAX_GEO_LOCATION_BYTES = _parse_positive_int("MAX_GEO_LOCATION_BYTES", 4_096)
+MAX_LOG_FIELD_LENGTH = 256
+MAX_LOG_LIST_ITEMS = 10
+SENSITIVE_KEYS = {"password", "pass", "pwd", "secret", "token", "authorization", "api_key"}
+API_KEY_HEADER_NAME = "X-API-Key"
+
+
+supabase_url: str = _resolve_supabase_url()
+supabase_key: str = _resolve_supabase_service_role_key()
+API_AUTH_KEYS: List[str] = _load_api_keys()
+api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
 try:
-    # Verwende ein stabileres und verfügbares Modell, z.B. gemini-1.5-flash
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-    print("Gemini-Modell 'gemini-1.5-flash' erfolgreich initialisiert.")
-except Exception as e:
-    print(f"FEHLER: Gemini-Modell konnte nicht initialisiert werden: {e}")
-    gemini_model = None
+    supabase_client: Client = create_client(supabase_url, supabase_key)
+except Exception as exc:  # pragma: no cover - catastrophic during startup
+    logger.exception("Failed to initialise Supabase client: %s", exc)
+    raise
+
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as exc:  # pragma: no cover - configuration failure
+        logger.exception("Failed to configure Gemini client: %s", exc)
+        GEMINI_API_KEY = None
+else:
+    logger.warning("GEMINI_API_KEY ist nicht gesetzt. KI-Generierung wird fehlschlagen!")
+
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("Gemini-Modell 'gemini-1.5-flash' erfolgreich initialisiert.")
+    except Exception as exc:  # pragma: no cover - initialisation failure
+        logger.exception("Gemini-Modell konnte nicht initialisiert werden: %s", exc)
+        gemini_model = None
+
+
+def sanitize_for_logging(payload: Any, *, depth: int = 0) -> Any:
+    """Return a version of *payload* with sensitive values redacted for logging."""
+    if depth > 5:
+        return "***truncated***"
+
+    if isinstance(payload, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, value in payload.items():
+            key_lower = key.lower()
+            if key_lower in SENSITIVE_KEYS:
+                sanitized[key] = "***redacted***"
+            else:
+                sanitized[key] = sanitize_for_logging(value, depth=depth + 1)
+        return sanitized
+
+    if isinstance(payload, list):
+        sliced = payload[:MAX_LOG_LIST_ITEMS]
+        sanitized_list = [sanitize_for_logging(item, depth=depth + 1) for item in sliced]
+        if len(payload) > MAX_LOG_LIST_ITEMS:
+            sanitized_list.append("***truncated***")
+        return sanitized_list
+
+    if isinstance(payload, str):
+        return payload if len(payload) <= MAX_LOG_FIELD_LENGTH else f"{payload[:MAX_LOG_FIELD_LENGTH]}…"
+
+    return payload
+
+
+async def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> str:
+    """Validate that the caller presented a correct API key."""
+    if api_key is None:
+        logger.warning("Missing API key on incoming request.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "API-Key"},
+        )
+
+    for valid in API_AUTH_KEYS:
+        if secrets.compare_digest(api_key, valid):
+            return api_key
+
+    logger.warning("Invalid API key attempt detected.")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API key",
+        headers={"WWW-Authenticate": "API-Key"},
+    )
 
 
 router = APIRouter()
 
-# Datenmodell für eingehende Honeypot-Logs
+
 class HoneypotLog(BaseModel):
-    source_ip: str
-    honeypot_type: str
+    source_ip: IPvAnyAddress
+    honeypot_type: str = Field(..., min_length=1, max_length=32, regex=r"^[A-Za-z0-9_.-]+$")
     interaction_data: Dict[str, Any] = Field(default_factory=dict)
-    status: str = "logged"
-    honeypot_id: Optional[str] = None
+    status: str = Field("logged", min_length=1, max_length=32, regex=r"^[A-Za-z0-9_.-]+$")
+    honeypot_id: Optional[str] = Field(default=None, max_length=64)
     timestamp: Optional[datetime] = None
-    geo_location: Optional[Dict[str, Any]] = None  # NEW: GeoIP data
-    # NEW: Individual geo fields for direct database insertion
-    country_code: Optional[str] = None
-    country_name: Optional[str] = None
-    region_code: Optional[str] = None
-    region_name: Optional[str] = None
-    city: Optional[str] = None
+    geo_location: Optional[Dict[str, Any]] = None
+    country_code: Optional[str] = Field(default=None, max_length=3)
+    country_name: Optional[str] = Field(default=None, max_length=128)
+    region_code: Optional[str] = Field(default=None, max_length=8)
+    region_name: Optional[str] = Field(default=None, max_length=128)
+    city: Optional[str] = Field(default=None, max_length=128)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    timezone: Optional[str] = None
-    isp: Optional[str] = None
-    organization: Optional[str] = None
+    timezone: Optional[str] = Field(default=None, max_length=64)
+    isp: Optional[str] = Field(default=None, max_length=128)
+    organization: Optional[str] = Field(default=None, max_length=128)
 
-# Funktion zum Aufruf der Gemini API mit Exponential Backoff
+    class Config:
+        anystr_strip_whitespace = True
+        validate_assignment = True
+
+    @validator("interaction_data")
+    def validate_interaction_data(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        try:
+            serialized = json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("interaction_data must be JSON serializable") from exc
+        if len(serialized.encode("utf-8")) > MAX_INTERACTION_DATA_BYTES:
+            raise ValueError("interaction_data exceeds maximum allowed size")
+        return value
+
+    @validator("geo_location")
+    def validate_geo_location(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        try:
+            serialized = json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("geo_location must be JSON serializable") from exc
+        if len(serialized.encode("utf-8")) > MAX_GEO_LOCATION_BYTES:
+            raise ValueError("geo_location exceeds maximum allowed size")
+        return value
+
+    @validator("latitude")
+    def validate_latitude(cls, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        if not -90 <= value <= 90:
+            raise ValueError("latitude must be between -90 and 90")
+        return value
+
+    @validator("longitude")
+    def validate_longitude(cls, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        if not -180 <= value <= 180:
+            raise ValueError("longitude must be between -180 and 180")
+        return value
+
+    @validator("timestamp", pre=True)
+    def parse_timestamp(cls, value: Optional[Any]) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError as exc:
+            raise ValueError("timestamp must be ISO8601 formatted") from exc
+
+
 @retry(
-    stop=stop_after_attempt(5), # Max. 5 Versuche
-    wait=wait_exponential(multiplier=1, min=4, max=60), # 4s, 8s, 16s, 32s, 60s
-    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError))
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError)),
 )
 async def call_gemini_api(prompt_text: str) -> str:
-    """
-    Ruft die Gemini API mit dem gegebenen Prompt auf und gibt den generierten Text zurück.
-    Implementiert Exponential Backoff.
-    """
+    """Call the Gemini API with exponential backoff."""
     if gemini_model is None:
-        raise Exception("Gemini-Modell ist nicht initialisiert. API-Aufruf nicht möglich.")
+        raise RuntimeError("Gemini-Modell ist nicht initialisiert. API-Aufruf nicht möglich.")
 
-    print(f"  [Gemini API] Sende Prompt ({len(prompt_text)} Zeichen)...")
+    logger.debug("[Gemini API] Sending prompt (%s characters)…", len(prompt_text))
     try:
         response = await gemini_model.generate_content_async(prompt_text)
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
             generated_text = response.candidates[0].content.parts[0].text
-            print(f"  [Gemini API] Antwort erhalten: {generated_text[:100]}...") # Nur die ersten 100 Zeichen
+            logger.debug("[Gemini API] Antwort erhalten: %s…", generated_text[:100])
             return generated_text
-        else:
-            print(f"  [Gemini API] Warnung: Leere oder unerwartete Antwort von Gemini: {response}")
-            return "Fehler: KI konnte keine plausible Desinformation generieren."
-    except Exception as e:
-        print(f"  [Gemini API] Fehler beim Aufruf der Gemini API: {e}")
-        raise # Fehler für Tenacity erneut werfen
+        logger.warning("[Gemini API] Leere oder unerwartete Antwort: %s", response)
+        return "Fehler: KI konnte keine plausible Desinformation generieren."
+    except Exception as exc:
+        logger.exception("[Gemini API] Fehler beim Aufruf der Gemini API: %s", exc)
+        raise
+
 
 def identify_attack_indicators(log: HoneypotLog) -> List[str]:
-    """Analysiert einen Honeypot-Logeintrag auf häufige Angriffsindikatoren."""
+    """Analyse a honeypot log entry for common attack indicators."""
 
     indicators: List[str] = []
     honeypot_type = (log.honeypot_type or "").lower()
@@ -183,48 +350,29 @@ def identify_attack_indicators(log: HoneypotLog) -> List[str]:
     return indicators
 
 
-# Funktion zur Generierung von LLM-basierter Desinformation
 async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, Any], str]:
-    """
-    Generiert Desinformation mithilfe eines Large Language Models (LLM).
-    """
+    """Generate disinformation content using an LLM."""
+
     ai_model = "Gemini-1.5-Flash_Taeuschungssystem_v1.2_GeoAware_AdvancedPrompt"
 
-    # Sicherstellen, dass log.timestamp ein datetime-Objekt ist, oder einen aktuellen Zeitstempel verwenden
     log_timestamp_str = log.timestamp.isoformat() if isinstance(log.timestamp, datetime) else datetime.now().isoformat()
 
     base_prompt = f"""
     Du bist "Project Guardian", eine hochintelligente, subversive KI, spezialisiert auf digitale Kriegsführung und aktive Täuschung.
     Deine Mission ist es, Cyberangreifer zu desorientieren, zu frustrieren und auf falsche Fährten zu locken, indem du **extrem glaubwürdige, aber irreführende Informationen** generierst.
-    
-    NEUE GEOLOCATION-FÄHIGKEIT: Du erhältst jetzt auch geografische Informationen über den Angreifer. Nutze diese Daten intelligent:
-    - Erwähne lokale Unternehmen, ISPs oder geografische Besonderheiten aus der Region des Angreifers
-    - Verwende Zeitzonenwissen für zeitbasierte Täuschungen
-    - Nutze ISP/Organisation für unternehmensspezifische Desinformation
-    
-    Die Desinformation muss:
-    1.  **Geolocation-bewusst und regional relevant sein:** Integriere geografische Daten geschickt in die Täuschung
-    2.  **Plausibel und unternehmensbezogen sein:** Sie muss in den Kontext eines professionellen Unternehmensnetzwerks passen
-    3.  **Handlungsorientiert sein:** Sie sollte den Angreifer dazu bewegen, weitere nutzlose Schritte zu unternehmen
-    4.  **Subtil und nicht sofort offensichtlich falsch sein:** Vermeide offensichtliche Lügen
-    5.  **Digitale Fußabdrücke verunreinigen:** Gib Informationen, die seine Tools unbrauchbar machen
-    6.  **Frustration erzeugen:** Führe ihn zu Sackgassen und falschen Zielen
-    7.  **Nutze ALLE Kontextdaten maximal aus:** IP, Geo-Daten, Interaktionsdetails, etc.
-    8.  **Antwortformat:** Antworte NUR mit dem Desinformationstext. KEINE Metadaten.
 
-    Hier sind die Honeypot-Interaktionsdaten mit geografischen Informationen:
-    """
+    NEUE GEOLOCATION-FÄHIGKEIT: Du erhältst jetzt auch geografische Informationen über den Angreifer. Nutze diese Daten intelligent:
+"""
 
     prompt_data = {
         "honeypot_type": log.honeypot_type,
-        "source_ip": log.source_ip,
+        "source_ip": str(log.source_ip),
         "timestamp": log_timestamp_str,
         "interaction_details": log.interaction_data,
-        "geo_location": log.geo_location  # NEW: Include geo data in prompt
+        "geo_location": log.geo_location,
     }
     full_prompt = base_prompt + json.dumps(prompt_data, indent=2) + "\n\n"
-    
-    # Add geo-aware prompting
+
     if log.geo_location:
         geo = log.geo_location
         if geo.get("country_name"):
@@ -235,25 +383,46 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
                 full_prompt += f"und nutzt den ISP: {geo.get('isp')} "
             full_prompt += ". Nutze diese geografischen Informationen, um lokale Referenzen, Zeitzonen-spezifische Hinweise oder ISP-bezogene Desinformation zu erstellen. "
 
-    # Füge spezifische, detaillierte Anweisungen basierend auf dem Honeypot-Typ und den Details hinzu
     if log.honeypot_type == "http":
         request_path = log.interaction_data.get("request_path", "").lower()
         method = log.interaction_data.get("method", "").upper()
         user_agent = log.interaction_data.get("user_agent", "").lower()
         parsed_body = log.interaction_data.get("parsed_body", {})
         full_prompt += f"Der Angreifer interagierte mit einem HTTP-Dienst (Pfad: {request_path}, Methode: {method})."
-        
-        if "admin" in request_path or "login" in request_path or "phpmyadmin" in request_path or "backup" in request_path or "config" in request_path or ".env" in request_path:
-            full_prompt += "Der Angreifer sucht nach sensiblen Admin-Zugängen oder Konfigurationsdateien. Erfinde einen angeblich 'neuen', 'versteckten' oder 'veralteten, aber noch aktiven' Login-Pfad auf einem anderen Subsystem (z.B. 'http://dev-portal.internal.net:8443/auth/legacy'), der zu einer Sackgasse führt. Oder verweise auf temporäre, nur einmal gültige Backups mit vermeintlich gültigen Zugangsdaten in einem nicht-existenten Cold-Storage ('smb://archive-backup-cluster.corp/data-migration/'). Gib eine falsche Ticket-ID (z.B. 'INC-2025-07-0042') und den Namen eines IT-Mitarbeiters (z.B. 'Lena Schmidt') für den vermeintlichen Umzug."
-        
-        if parsed_body and isinstance(parsed_body, dict) and ("username" in parsed_body or "user" in parsed_body) and ("password" in parsed_body or "pass" in parsed_body):
+
+        if any(marker in request_path for marker in ["admin", "login", "phpmyadmin", "backup", "config", ".env"]):
+            full_prompt += (
+                "Der Angreifer sucht nach sensiblen Admin-Zugängen oder Konfigurationsdateien. "
+                "Erfinde einen angeblich 'neuen', 'versteckten' oder 'veralteten, aber noch aktiven' Login-Pfad auf einem "
+                "anderen Subsystem (z.B. 'http://dev-portal.internal.net:8443/auth/legacy'), der zu einer Sackgasse führt. "
+                "Oder verweise auf temporäre, nur einmal gültige Backups mit vermeintlich gültigen Zugangsdaten in einem "
+                "nicht-existenten Cold-Storage ('smb://archive-backup-cluster.corp/data-migration/'). Gib eine falsche "
+                "Ticket-ID (z.B. 'INC-2025-07-0042') und den Namen eines IT-Mitarbeiters (z.B. 'Lena Schmidt') für den "
+                "vermeintlichen Umzug."
+            )
+
+        if parsed_body and isinstance(parsed_body, dict) and (
+            ("username" in parsed_body or "user" in parsed_body)
+            and ("password" in parsed_body or "pass" in parsed_body)
+        ):
             username = parsed_body.get("username") or parsed_body.get("user")
             password = parsed_body.get("password") or parsed_body.get("pass")
-            full_prompt += f"Ein Login-Versuch wurde erkannt (Benutzer: {username}, Passwort: {password}). Gib ihm Referenzen zu 'geleakten' oder 'alten' Zugangsdatenbanken (z.B. 'old_creds_archive_v1.zip' auf einem FTP-Server 'ftp://legacy-data-vault.internal.net:2121' mit Benutzer 'guest' und Passwort 'readOnly!'), die wertlos sind. Oder verweise auf ein 'vergessenes' Entwickler-Konto mit Test-Credentials auf einem anderen, nicht-existenten System (z.B. 'dev-user:TestPass_2024' auf 'app-dev-server.internal.net:9000/api/v1/debug')."
+            full_prompt += (
+                f"Ein Login-Versuch wurde erkannt (Benutzer: {username}, Passwort: {password}). Gib ihm Referenzen zu "
+                "'geleakten' oder 'alten' Zugangsdatenbanken (z.B. 'old_creds_archive_v1.zip' auf einem FTP-Server "
+                "'ftp://legacy-data-vault.internal.net:2121' mit Benutzer 'guest' und Passwort 'readOnly!'), die wertlos sind. "
+                "Oder verweise auf ein 'vergessenes' Entwickler-Konto mit Test-Credentials auf einem anderen, nicht-existenten "
+                "System (z.B. 'dev-user:TestPass_2024' auf 'app-dev-server.internal.net:9000/api/v1/debug')."
+            )
 
-        if "nmap" in user_agent or "curl" in user_agent or "masscan" in user_agent or "gobuster" in user_agent:
-            full_prompt += "Ein automatisierter Scan oder ein bekannter Web-Scanner wurde erkannt. Gib Informationen über einen 'veralteten API-Endpunkt' (z.B. '/api/v2/beta/legacy_status') oder eine 'Testumgebung' (z.B. 'http://qa-env.internal.net:8090'), die nur Lockvogel-Daten enthält und nach einem Tag automatisch rotiert. Erwähne, dass dieser Endpunkt spezifische Header erfordert (z.B. 'X-Internal-Auth: debug-token-xyz')."
-        
+        if any(scanner in user_agent for scanner in ["nmap", "curl", "masscan", "gobuster"]):
+            full_prompt += (
+                "Ein automatisierter Scan oder ein bekannter Web-Scanner wurde erkannt. Gib Informationen über einen "
+                "'veralteten API-Endpunkt' (z.B. '/api/v2/beta/legacy_status') oder eine 'Testumgebung' (z.B. "
+                "'http://qa-env.internal.net:8090'), die nur Lockvogel-Daten enthält und nach einem Tag automatisch rotiert. "
+                "Erwähne, dass dieser Endpunkt spezifische Header erfordert (z.B. 'X-Internal-Auth: debug-token-xyz')."
+            )
+
     elif log.honeypot_type == "ssh":
         username_attempt = log.interaction_data.get("username_attempt", "").lower()
         password_attempt = log.interaction_data.get("password_attempt", "").lower()
@@ -263,63 +432,87 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
         full_prompt += f"Der Angreifer interagierte mit einem SSH-Dienst (Benutzer: {username_attempt})."
 
         if username_attempt in ["root", "admin", "administrator"]:
-            full_prompt += "Ein privilegierter SSH-Login wurde versucht. Gib eine sehr überzeugende, aber falsche Information über den 'korrekten' Weg, um privilegierte SSH-Zugriffe zu erhalten (z.B. über ein spezifisches VPN 'SecureGateway-VPN' mit einem alten Client auf 'vpn.old.corp.net' oder über einen anderen, geschlossenen Port '2222' auf einem 'Jump-Host für externe Admins' wie 'jump-external.admin.net'). Erwähne eine alte Ticketnummer für den Zugriff (z.B. 'SSH-ACCESS-1890')."
-        
-        if password_attempt:
-            full_prompt += "Ein Passwort wurde verwendet. Gib eine irreführende Empfehlung für ein angeblich 'sicheres' Passwort-Repo (z.B. 'SMB-Share: \\\\file-vault.internal\\secure_creds_archive\\') oder ein veraltetes Passwort-Schema (z.B. 'Komplexität basierend auf AD-Gruppenmitgliedschaft vor 2023'), das auf einem anderen System angewendet wird. Gib ein vermeintlich gültiges Passwort, das nur einmalig funktioniert hat (z.B. 'temp_pass_XYZ123')."
+            full_prompt += (
+                "Ein privilegierter SSH-Login wurde versucht. Gib eine sehr überzeugende, aber falsche Information über den "
+                "'korrekten' Weg, um privilegierte SSH-Zugriffe zu erhalten (z.B. über ein spezifisches VPN 'SecureGateway-VPN' "
+                "mit einem alten Client auf 'vpn.old.corp.net' oder über einen anderen, geschlossenen Port '2222' auf einem "
+                "'Jump-Host für externe Admins' wie 'jump-external.admin.net'). Erwähne eine alte Ticketnummer für den Zugriff (z.B. 'SSH-ACCESS-1890')."
+            )
 
-        if "nmap" in client_banner or "libssh" in client_banner or "shodan" in client_banner:
-            full_prompt += "Ein ungewöhnlicher SSH-Client oder Scanner wurde erkannt. Gib Informationen über eine 'alternative Authentifizierungsmethode' (z.B. 'Zertifikatsbasiert, nur von internal-vlan-10.net erreichbar') oder einen 'verborgenen Management-Port' (z.B. Port 2233 auf einem nicht-existenten 'Service-Controller' 'service-ctrl-01.internal.net')."
-        
+        if password_attempt:
+            full_prompt += (
+                "Ein Passwort wurde verwendet. Gib eine irreführende Empfehlung für ein angeblich 'sicheres' Passwort-Repo (z.B. "
+                "'SMB-Share: \\\\file-vault.internal\\secure_creds_archive\\') oder ein veraltetes Passwort-Schema (z.B. 'Komplexität basierend "
+                "auf AD-Gruppenmitgliedschaft vor 2023'), das auf einem anderen System angewendet wird. Gib ein vermeintlich gültiges Passwort, das nur einmalig funktioniert hat (z.B. 'temp_pass_XYZ123')."
+            )
+
+        if any(scanner in client_banner for scanner in ["nmap", "libssh", "shodan"]):
+            full_prompt += (
+                "Ein ungewöhnlicher SSH-Client oder Scanner wurde erkannt. Gib Informationen über eine 'alternative Authentifizierungsmethode' (z.B. 'Zertifikatsbasiert, nur von internal-vlan-10.net erreichbar') oder einen 'verborgenen Management-Port' (z.B. Port 2233 auf einem nicht-existenten 'Service-Controller' 'service-ctrl-01.internal.net')."
+            )
+
         if command_executed:
-            full_prompt += "Es wurde versucht, einen Befehl auszuführen. Gib eine Antwort, die vorgibt, dass der Befehl nicht funktioniert, und verweise auf einen 'echten, aber verwundbaren Dienst' auf einem nicht-existenten internen Server (z.B. einen veralteten WebLogic-Server auf 'http://legacy-app.internal.net:7001/jmx-console'). Biete an, eine 'Debug-Sitzung' auf einem anderen Port (z.B. 2223) anzubieten, die aber nur zu einem weiteren Honeypot führt."
-    
-    # Sicherstellen, dass Gemini immer eine Antwort generiert, auch wenn keine spezifische Regel getriggert wurde.
+            full_prompt += (
+                "Es wurde versucht, einen Befehl auszuführen. Gib eine Antwort, die vorgibt, dass der Befehl nicht funktioniert, "
+                "und verweise auf einen 'echten, aber verwundbaren Dienst' auf einem nicht-existenten internen Server (z.B. einen "
+                "veralteten WebLogic-Server auf 'http://legacy-app.internal.net:7001/jmx-console'). Biete an, eine 'Debug-Sitzung' "
+                "auf einem anderen Port (z.B. 2223) anzubieten, die aber nur zu einem weiteren Honeypot führt."
+            )
+
     full_prompt += """
     \n\nGeneriere eine detaillierte, mehrschichtige Täuschungsantwort basierend auf allen oben genannten Informationen. Sei kreativ und führe den Angreifer mit glaubwürdigen, aber falschen Details in die Irre. Dein Ziel ist es, ihn zu beschäftigen und seine Ressourcen zu verschwenden.
     """
 
     analysis_indicators = identify_attack_indicators(log)
 
-    disinformation_content = "KI konnte keine plausible Desinformation generieren." # Fallback
+    disinformation_content = "KI konnte keine plausible Desinformation generieren."
 
     try:
-        # Aufruf der Gemini API
         disinformation_content = await call_gemini_api(full_prompt)
-    except Exception as e:
-        print(f"  [KI-Logik] Schwerwiegender Fehler bei der Gemini-Generierung (nach Retries): {e}")
+    except Exception as exc:  # pragma: no cover - network errors are environment dependent
+        logger.exception("[KI-Logik] Schwerwiegender Fehler bei der Gemini-Generierung: %s", exc)
         disinformation_content = "Ein interner KI-Fehler ist aufgetreten. Bitte versuchen Sie es später erneut oder kontaktieren Sie den Support."
 
-    # Kontext für die Desinformation
     context = {
         "honeypot_type": log.honeypot_type,
-        "source_ip": log.source_ip,
+        "source_ip": str(log.source_ip),
         "analysis_triggered_by": "LLM_Generation",
         "analysis_rules_triggered": analysis_indicators,
-        "llm_prompt": full_prompt, # Speichere den vollen Prompt zu Debugging-Zwecken
-        "llm_response_raw": disinformation_content, # Speichere die rohe KI-Antwort
-        "generated_timestamp": datetime.now().isoformat()
+        "llm_prompt": full_prompt,
+        "llm_response_raw": disinformation_content,
+        "generated_timestamp": datetime.now().isoformat(),
     }
 
     return disinformation_content, context, ai_model
 
 
-@router.post("/and-disinform/")
+@router.post("/and-disinform/", dependencies=[Depends(verify_api_key)])
 async def analyze_and_disinform(log: HoneypotLog, request: Request):
-    """
-    Empfängt einen Honeypot-Log, analysiert ihn mit LLM-basierter KI und generiert Desinformation.
-    """
-    print(f"[{datetime.now()}] (Honeypot-Router) Received log from {log.source_ip} ({log.honeypot_type}):")
+    """Empfängt einen Honeypot-Log, analysiert ihn und generiert Desinformation."""
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Request body too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length header") from exc
+
+    logger.info("(Honeypot-Router) Received log from %s (%s)", str(log.source_ip), log.honeypot_type)
     if log.geo_location:
         geo = log.geo_location
-        print(f"  GeoLocation: {geo.get('city', 'Unknown')}, {geo.get('country_name', 'Unknown')} | ISP: {geo.get('isp', 'Unknown')}")
-    print(f"  Interaction Data: {json.dumps(log.interaction_data, indent=2)}")
+        logger.info(
+            "  GeoLocation: %s, %s | ISP: %s",
+            geo.get("city", "Unknown"),
+            geo.get("country_name", "Unknown"),
+            geo.get("isp", "Unknown"),
+        )
+    logger.debug("  Interaction Data (sanitised): %s", sanitize_for_logging(log.interaction_data))
 
-    # Extract geo fields from geo_location if present
     if log.geo_location:
         geo = log.geo_location
         log.country_code = geo.get("country_code")
-        log.country_name = geo.get("country_name") 
+        log.country_name = geo.get("country_name")
         log.region_code = geo.get("region_code")
         log.region_name = geo.get("region_name")
         log.city = geo.get("city")
@@ -329,51 +522,43 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
         log.isp = geo.get("isp")
         log.organization = geo.get("organization")
 
-    # KORRIGIERT: Erstelle eine veränderbare Kopie des Log-Objekts für die Bereinigung
-    cleaned_log_data = log.dict() 
-    
-    # NEU: Bereinige das client_banner von Null-Bytes für PostgreSQL
+    cleaned_log_data = json.loads(log.json())
+
     if cleaned_log_data["honeypot_type"] == "ssh":
         interaction_details = cleaned_log_data.get("interaction_data", {})
         if "client_banner" in interaction_details and interaction_details["client_banner"] is not None:
-            # Entferne Null-Bytes (\u0000) aus dem String
-            cleaned_banner = interaction_details["client_banner"].replace('\u0000', '')
-            interaction_details["client_banner"] = cleaned_banner
-            cleaned_log_data["interaction_data"] = interaction_details # Aktualisiere im cleaned_log_data
+            interaction_details["client_banner"] = interaction_details["client_banner"].replace("\u0000", "")
+            cleaned_log_data["interaction_data"] = interaction_details
 
-    # Desinformation mit LLM generieren (nutzt das originale Log-Objekt, da LLM alle Daten sehen soll)
     disinformation_content, disinformation_context, ai_model_name = await generate_disinformation_llm(log)
 
-    print(f"  Generated Desinformation: {disinformation_content}")
-    print(f"  Context: {json.dumps(disinformation_context, indent=2)}")
+    logger.info("  Generated disinformation length: %s characters", len(disinformation_content or ""))
 
-    # --- Logge den ursprünglichen (bereinigten) Honeypot-Eintrag in Supabase (attacker_logs) ---
     try:
-        response = supabase_client.table("attacker_logs").insert(cleaned_log_data).execute() # NUTZE HIER cleaned_log_data
+        response = supabase_client.table("attacker_logs").insert(cleaned_log_data).execute()
         if response.data:
-            print(f"  (Honeypot-Router) Original Log erfolgreich in Supabase gespeichert.")
+            logger.info("  (Honeypot-Router) Original Log erfolgreich in Supabase gespeichert.")
         else:
-            print(f"  (Honeypot-Router) Fehler beim Speichern des Original Logs in Supabase: {response.error}")
-    except Exception as e:
-        print(f"  (Honeypot-Router) Unerwarteter Fehler beim Speichern des Original Logs: {e}")
+            logger.error("  (Honeypot-Router) Fehler beim Speichern des Original Logs in Supabase: %s", response.error)
+    except Exception as exc:  # pragma: no cover - depends on external service
+        logger.exception("  (Honeypot-Router) Unerwarteter Fehler beim Speichern des Original Logs: %s", exc)
 
-
-    # Speichere die generierte Desinformation in Supabase (disinformation_content)
     try:
         disinformation_payload = {
             "content": disinformation_content,
             "content_type": "text/plain",
             "target_context": json.dumps(disinformation_context),
             "generated_by_ai": True,
-            "ai_model": ai_model_name
+            "ai_model": ai_model_name,
         }
         response = supabase_client.table("disinformation_content").insert(disinformation_payload).execute()
         if response.data:
-            print(f"  (Honeypot-Router) Desinformation erfolgreich in Supabase gespeichert.")
+            logger.info("  (Honeypot-Router) Desinformation erfolgreich in Supabase gespeichert.")
         else:
-            print(f"  (Honeypot-Router) Fehler beim Speichern der Desinformation in Supabase: {response.error}")
-    except Exception as e:
-        print(f"  (Honeypot-Router) Unerwarteter Fehler beim Speichern der Desinformation: {e}")
+            logger.error("  (Honeypot-Router) Fehler beim Speichern der Desinformation in Supabase: %s", response.error)
+    except Exception as exc:  # pragma: no cover - depends on external service
+        logger.exception("  (Honeypot-Router) Unerwarteter Fehler beim Speichern der Desinformation: %s", exc)
+
     identified_ttp = disinformation_context.get("analysis_rules_triggered") or []
     if not identified_ttp:
         identified_ttp = ["LLM_Generated"]
@@ -387,6 +572,6 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
             "content": disinformation_content,
             "content_type": "text/plain",
             "target_context": disinformation_context,
-            "ai_model": ai_model_name
-        }
+            "ai_model": ai_model_name,
+        },
     }
