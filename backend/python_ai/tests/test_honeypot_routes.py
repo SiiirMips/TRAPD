@@ -111,10 +111,17 @@ def test_identify_attack_indicators_http_directory_traversal_and_scanner():
         },
     )
 
-    indicators = identify_attack_indicators(log)
+    result = identify_attack_indicators(log)
+    indicators = result["indicators"]
 
     assert "Directory Traversal" in indicators
     assert "Known Scanner" in indicators
+    assert result["scanner_type"] == "Nmap"
+    assert result["scan_pattern"] == "directory-traversal"
+    assert result["threat_level"] in {"high", "critical"}
+    assert result["tool_confidence"] >= 0.75
+    assert result["tool_confidence"] <= 1
+    assert result["is_real_browser"] is False
 
 
 def test_identify_attack_indicators_http_credential_stuffing():
@@ -131,10 +138,14 @@ def test_identify_attack_indicators_http_credential_stuffing():
         },
     )
 
-    indicators = identify_attack_indicators(log)
+    result = identify_attack_indicators(log)
+    indicators = result["indicators"]
 
     assert "Credential-Stuffing" in indicators
     assert "Directory Traversal" not in indicators
+    assert result["scan_pattern"] == "credential-stuffing"
+    assert result["threat_level"] in {"medium", "high"}
+    assert 0 <= result["tool_confidence"] <= 1
 
 
 def test_identify_attack_indicators_ssh_bruteforce_and_scanner():
@@ -149,7 +160,11 @@ def test_identify_attack_indicators_ssh_bruteforce_and_scanner():
         },
     )
 
-    indicators = identify_attack_indicators(log)
+    result = identify_attack_indicators(log)
+    indicators = result["indicators"]
 
     assert "SSH-Bruteforce" in indicators
     assert "Known Scanner" in indicators
+    assert result["scanner_type"] == "libssh"
+    assert result["scan_pattern"] in {"ssh-bruteforce", "post-exploitation"}
+    assert result["threat_level"] in {"high", "critical"}
