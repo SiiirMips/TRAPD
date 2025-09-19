@@ -22,152 +22,642 @@ import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { 
-  Activity, 
-  Shield, 
-  AlertTriangle, 
-  Globe, 
-  Users, 
+import {
+  Activity,
+  Shield,
+  AlertTriangle,
+  Globe,
+  Users,
   Server,
   RefreshCw,
-  Eye,
   MapPin,
   Clock,
   Zap
 } from "lucide-react"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
+import { supabase } from "@/supabaseClient"
+import type { RealtimeChannel, RealtimePostgresInsertPayload } from "@supabase/supabase-js"
+
+const ACTIVE_WINDOW_MINUTES = 15
+const MAX_STORED_EVENTS = 200
+
+const severityLabelMap = {
+  critical: "Critical",
+  high: "High",
+  medium: "Medium",
+  low: "Low"
+} as const
+
+type Severity = keyof typeof severityLabelMap
+
+type ThreatData = {
+  activeThreats: number
+  blockedAttempts: number
+  honeypotStatus: "connecting" | "active" | "reconnecting"
+  connectedAttackers: number
+}
+
+type AttackEvent = {
+  id: string
+  ip: string
+  country: string
+  countryKey: string
+  type: string
+  severity: Severity
+  threatLevelLabel: string
+  port: string
+  userAgent: string
+  payload: string
+  timestamp: string
+}
+
+type CountryStat = {
+  country: string
+  attacks: number
+  percentage: number
+}
+
+type ProtocolStat = {
+  type: string
+  count: number
+}
+
+type TimelineBucket = {
+  iso: string
+  label: string
+  count: number
+}
+
+type SeveritySummary = Record<Severity, number>
+
+type GenericRecord = Record<string, unknown>
+
+function ensureRecord(value: unknown): GenericRecord | null {
+  if (!value) return null
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as GenericRecord
+    } catch {
+      return null
+    }
+  }
+  if (typeof value === "object") {
+    return value as GenericRecord
+  }
+  return null
+}
+
+function getStringField(record: GenericRecord, key: string): string | undefined {
+  const value = record[key]
+  if (typeof value === "string" && value.trim()) {
+    return value.trim()
+  }
+  if (typeof value === "number") {
+    return value.toString()
+  }
+  return undefined
+}
+
+function deriveThreatLevel(record: GenericRecord): Severity {
+  const rawLevel = record["threat_level"]
+  const level = typeof rawLevel === "string" ? rawLevel.toLowerCase() : ""
+  if (level === "critical") return "critical"
+  if (level === "high") return "high"
+  if (level === "medium") return "medium"
+  if (level === "low") return "low"
+
+  const confidenceValue = record["tool_confidence"]
+  const confidence = typeof confidenceValue === "number"
+    ? confidenceValue
+    : typeof confidenceValue === "string"
+      ? Number(confidenceValue)
+      : undefined
+
+  if (typeof confidence === "number" && !Number.isNaN(confidence)) {
+    if (confidence >= 0.75) return "high"
+    if (confidence >= 0.4) return "medium"
+  }
+
+  const hasScanner = typeof record["scanner_type"] === "string" && (record["scanner_type"] as string).trim() !== ""
+  if (hasScanner) {
+    return "medium"
+  }
+
+  return "low"
+}
+
+function buildCountryLabel(record: GenericRecord): { key: string; label: string } {
+  const rawCode = getStringField(record, "country_code")
+  const countryCode = rawCode ? rawCode.toUpperCase() : ""
+  const countryName = getStringField(record, "country_name") ?? ""
+  if (countryName && countryCode) {
+    return { key: countryCode, label: `${countryName} (${countryCode})` }
+  }
+  if (countryName) {
+    return { key: countryName, label: countryName }
+  }
+  if (countryCode) {
+    return { key: countryCode, label: countryCode }
+  }
+  return { key: "Unknown", label: "Unknown" }
+}
+
+function extractUserAgent(data: GenericRecord | null): string {
+  if (!data) return "Unknown"
+  const userAgent = getStringField(data, "user_agent")
+  if (userAgent) {
+    return userAgent
+  }
+  const headers = ensureRecord(data["headers"])
+  if (headers) {
+    const headerUA = getStringField(headers, "User-Agent")
+      ?? getStringField(headers, "user-agent")
+      ?? getStringField(headers, "USER_AGENT")
+    if (headerUA) {
+      return headerUA
+    }
+  }
+  const client = getStringField(data, "client")
+  if (client) {
+    return client
+  }
+  return "Unknown"
+}
+
+function extractPayload(data: GenericRecord | null): string {
+  if (!data) return "—"
+  const candidates = ["payload", "command", "request", "message", "body", "data"]
+  for (const key of candidates) {
+    const value = data[key]
+    if (typeof value === "string" && value.trim()) {
+      return value.trim()
+    }
+  }
+  return "—"
+}
+
+function extractPort(record: GenericRecord, interaction: GenericRecord | null): string {
+  const candidates = [
+    record["target_port"],
+    record["destination_port"],
+    interaction?.["port"],
+    interaction?.["dst_port"],
+    interaction?.["destination_port"],
+    interaction?.["local_port"],
+    interaction?.["remote_port"]
+  ]
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return String(candidate)
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const numeric = Number(candidate)
+      return Number.isNaN(numeric) ? candidate.trim() : String(numeric)
+    }
+  }
+
+  return "—"
+}
+
+function normalizeAttackRecord(raw: GenericRecord): AttackEvent | null {
+  if (!raw) return null
+  const id = getStringField(raw, "id")
+    ?? getStringField(raw, "uuid")
+    ?? getStringField(raw, "log_id")
+  const timestampValue = getStringField(raw, "timestamp")
+    ?? getStringField(raw, "inserted_at")
+    ?? getStringField(raw, "created_at")
+  if (!id || !timestampValue) return null
+
+  const interaction = ensureRecord(raw["interaction_data"])
+  const severity = deriveThreatLevel(raw)
+  const { key: countryKey, label: countryLabel } = buildCountryLabel(raw)
+  const typeParts = [getStringField(raw, "honeypot_type"), getStringField(raw, "scanner_type")]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .map(value => value.trim())
+
+  const type = typeParts.length > 0 ? typeParts.join(" · ") : "Unknown activity"
+  const rawThreatLevel = getStringField(raw, "threat_level")
+  const threatLevelLabel = rawThreatLevel ?? severityLabelMap[severity]
+
+  const timestamp = new Date(timestampValue).toISOString()
+
+  return {
+    id,
+    ip: getStringField(raw, "source_ip")
+      ?? getStringField(raw, "ip")
+      ?? "Unknown",
+    country: countryLabel,
+    countryKey,
+    type,
+    severity,
+    threatLevelLabel,
+    port: extractPort(raw, interaction),
+    userAgent: extractUserAgent(interaction),
+    payload: extractPayload(interaction),
+    timestamp
+  }
+}
+
+function computeActiveThreats(attacks: AttackEvent[]): number {
+  const threshold = Date.now() - ACTIVE_WINDOW_MINUTES * 60 * 1000
+  return attacks.filter(attack => Date.parse(attack.timestamp) >= threshold).length
+}
+
+function buildTopCountryStats(attacks: AttackEvent[]): CountryStat[] {
+  const counts = new Map<string, { label: string; count: number }>()
+  for (const attack of attacks) {
+    const entry = counts.get(attack.countryKey)
+    if (entry) {
+      entry.count += 1
+    } else {
+      counts.set(attack.countryKey, { label: attack.country, count: 1 })
+    }
+  }
+  const totals = Array.from(counts.values())
+  const totalAttacks = totals.reduce((sum, item) => sum + item.count, 0)
+  return totals
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5)
+    .map(item => ({
+      country: item.label,
+      attacks: item.count,
+      percentage: totalAttacks > 0 ? Math.round((item.count / totalAttacks) * 100) : 0
+    }))
+}
+
+function buildProtocolStats(attacks: AttackEvent[]): ProtocolStat[] {
+  const counts = new Map<string, number>()
+  for (const attack of attacks) {
+    const key = attack.type
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 6)
+}
+
+function buildTimelineBuckets(attacks: AttackEvent[]): TimelineBucket[] {
+  const bucketSizeMs = 15 * 60 * 1000
+  const buckets = new Map<number, number>()
+  for (const attack of attacks) {
+    const time = Date.parse(attack.timestamp)
+    if (Number.isNaN(time)) continue
+    const bucketStart = Math.floor(time / bucketSizeMs) * bucketSizeMs
+    buckets.set(bucketStart, (buckets.get(bucketStart) ?? 0) + 1)
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => b[0] - a[0])
+    .slice(0, 5)
+    .map(([start, count]) => ({
+      iso: new Date(start).toISOString(),
+      label: new Date(start).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      count
+    }))
+}
+
+function buildThreatSummary(attacks: AttackEvent[]): SeveritySummary {
+  const summary: SeveritySummary = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0
+  }
+  for (const attack of attacks) {
+    summary[attack.severity] += 1
+  }
+  return summary
+}
+
+function collectHighSeverityPayloads(attacks: AttackEvent[]): string[] {
+  const samples: string[] = []
+  for (const attack of attacks) {
+    if ((attack.severity === "high" || attack.severity === "critical") && attack.payload !== "—") {
+      if (!samples.includes(attack.payload)) {
+        const truncated = attack.payload.length > 140
+          ? `${attack.payload.slice(0, 137)}…`
+          : attack.payload
+        samples.push(truncated)
+      }
+    }
+    if (samples.length >= 3) break
+  }
+  return samples
+}
+
+function formatRelativeTime(timestamp: string): string {
+  const parsed = Date.parse(timestamp)
+  if (Number.isNaN(parsed)) return "Unknown"
+  const diffMs = Date.now() - parsed
+  const diffSeconds = Math.floor(diffMs / 1000)
+  if (diffSeconds < 30) return "Just now"
+  if (diffSeconds < 60) return `${diffSeconds}s ago`
+  const diffMinutes = Math.floor(diffSeconds / 60)
+  if (diffMinutes < 60) return `${diffMinutes} min ago`
+  const diffHours = Math.floor(diffMinutes / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+  const diffDays = Math.floor(diffHours / 24)
+  if (diffDays === 1) return "1 day ago"
+  return `${diffDays} days ago`
+}
+
+function severityVariant(severity: Severity): "destructive" | "default" | "secondary" {
+  if (severity === "critical" || severity === "high") return "destructive"
+  if (severity === "medium") return "default"
+  return "secondary"
+}
 
 export default function Page() {
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [lastUpdate, setLastUpdate] = useState(new Date())
-  const [threatData, setThreatData] = useState({
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
+  const [threatData, setThreatData] = useState<ThreatData>({
     activeThreats: 0,
     blockedAttempts: 0,
     honeypotStatus: "connecting",
     connectedAttackers: 0
   })
-  const [recentAttacks, setRecentAttacks] = useState([])
-  const [topCountries, setTopCountries] = useState([])
-  const [networkActivity, setNetworkActivity] = useState([])
+  const [recentAttacks, setRecentAttacks] = useState<AttackEvent[]>([])
+  const [topCountries, setTopCountries] = useState<CountryStat[]>([])
+  const [protocolStats, setProtocolStats] = useState<ProtocolStat[]>([])
+  const [timelineBuckets, setTimelineBuckets] = useState<TimelineBucket[]>([])
+  const [severitySummary, setSeveritySummary] = useState<SeveritySummary>({
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0
+  })
+  const [highSeveritySamples, setHighSeveritySamples] = useState<string[]>([])
   const [isConnected, setIsConnected] = useState(false)
 
-  // Simulate real-time data updates
+  const isMountedRef = useRef(false)
+  const channelRef = useRef<RealtimeChannel | null>(null)
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const lastHeartbeatRef = useRef<number>(Date.now())
+  const allAttacksRef = useRef<AttackEvent[]>([])
+  const totalEventCountRef = useRef<number>(0)
+
   useEffect(() => {
-    const connectToWebSocket = () => {
-      console.log("Connecting to honeypot data stream...")
-      setIsConnected(true)
-      
-      // Initial data load
-      setThreatData({
-        activeThreats: Math.floor(Math.random() * 50) + 10,
-        blockedAttempts: Math.floor(Math.random() * 2000) + 500,
-        honeypotStatus: "active",
-        connectedAttackers: Math.floor(Math.random() * 15) + 3
-      })
-
-      // Load initial attacks
-      const initialAttacks = generateRandomAttacks(10)
-      setRecentAttacks(initialAttacks)
-
-      // Load country data
-      setTopCountries([
-        { country: "Russia", attacks: Math.floor(Math.random() * 100) + 50, percentage: 35 },
-        { country: "China", attacks: Math.floor(Math.random() * 80) + 40, percentage: 24 },
-        { country: "USA", attacks: Math.floor(Math.random() * 60) + 30, percentage: 16 },
-        { country: "Brazil", attacks: Math.floor(Math.random() * 40) + 20, percentage: 10 },
-        { country: "India", attacks: Math.floor(Math.random() * 30) + 15, percentage: 8 },
-      ])
-    }
-
-    connectToWebSocket()
-
-    // Simulate real-time updates every 3-8 seconds
-    const updateInterval = setInterval(() => {
-      // Update threat metrics
-      setThreatData(prev => ({
-        activeThreats: Math.max(0, prev.activeThreats + Math.floor(Math.random() * 6) - 2),
-        blockedAttempts: prev.blockedAttempts + Math.floor(Math.random() * 10) + 1,
-        honeypotStatus: "active",
-        connectedAttackers: Math.max(0, prev.connectedAttackers + Math.floor(Math.random() * 4) - 1)
-      }))
-
-      // Add new attack (30% chance)
-      if (Math.random() < 0.3) {
-        const newAttack = generateRandomAttacks(1)[0]
-        setRecentAttacks(prev => [newAttack, ...prev.slice(0, 9)])
-      }
-
-      // Update country stats
-      setTopCountries(prev => prev.map(country => ({
-        ...country,
-        attacks: country.attacks + Math.floor(Math.random() * 3)
-      })))
-
-      setLastUpdate(new Date())
-    }, Math.random() * 5000 + 3000) // 3-8 seconds
-
-    // Cleanup
+    isMountedRef.current = true
     return () => {
-      clearInterval(updateInterval)
-      setIsConnected(false)
+      isMountedRef.current = false
     }
   }, [])
 
-  const generateRandomAttacks = (count) => {
-    const attackTypes = [
-      "SSH Brute Force", "Port Scan", "Web Crawling", "SQL Injection", 
-      "RDP Attack", "FTP Brute Force", "HTTP Flood", "DNS Tunneling",
-      "Malware Download", "Credential Stuffing", "Directory Traversal"
-    ]
-    const countries = ["RU", "CN", "US", "BR", "IN", "KR", "VN", "TR", "IR", "PL"]
-    const severities = ["high", "medium", "low"]
-    
-    return Array.from({ length: count }, (_, index) => ({
-      id: Date.now() + index,
-      ip: `${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`,
-      country: countries[Math.floor(Math.random() * countries.length)],
-      type: attackTypes[Math.floor(Math.random() * attackTypes.length)],
-      time: "Just now",
-      severity: severities[Math.floor(Math.random() * severities.length)],
-      port: Math.floor(Math.random() * 65535) + 1,
-      userAgent: Math.random() > 0.5 ? "curl/7.68.0" : "Mozilla/5.0...",
-      payload: Math.random() > 0.7 ? "Detected" : "None"
-    }))
-  }
+  const updateHoneypotStatus = useCallback((status: ThreatData["honeypotStatus"]) => {
+    if (!isMountedRef.current) return
+    setThreatData(prev => (
+      prev.honeypotStatus === status
+        ? prev
+        : { ...prev, honeypotStatus: status }
+    ))
+  }, [])
 
-  const handleRefresh = async () => {
-    setIsRefreshing(true)
-    
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 1500))
-    
-    // Refresh all data
+  const applyAttackData = useCallback((attacks: AttackEvent[], totalCount: number, lastTimestamp?: string) => {
+    if (!isMountedRef.current) return
+
+    const sortedAttacks = attacks
+      .slice(0, MAX_STORED_EVENTS)
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+
+    allAttacksRef.current = sortedAttacks
+    totalEventCountRef.current = totalCount
+
+    const uniqueIps = new Set(sortedAttacks.map(attack => attack.ip || "Unknown"))
+
+    setRecentAttacks(sortedAttacks.slice(0, 20))
+    setTopCountries(buildTopCountryStats(sortedAttacks))
+    setProtocolStats(buildProtocolStats(sortedAttacks))
+    setTimelineBuckets(buildTimelineBuckets(sortedAttacks))
+    setSeveritySummary(buildThreatSummary(sortedAttacks))
+    setHighSeveritySamples(collectHighSeverityPayloads(sortedAttacks))
     setThreatData(prev => ({
       ...prev,
-      activeThreats: Math.floor(Math.random() * 50) + 10,
-      blockedAttempts: prev.blockedAttempts + Math.floor(Math.random() * 20) + 5
+      activeThreats: computeActiveThreats(sortedAttacks),
+      blockedAttempts: totalCount,
+      connectedAttackers: uniqueIps.size
     }))
-    
-    const newAttacks = generateRandomAttacks(5)
-    setRecentAttacks(prev => [...newAttacks, ...prev.slice(0, 5)])
-    
-    setIsRefreshing(false)
-    setLastUpdate(new Date())
-  }
 
-  // Auto-update attack times
-  useEffect(() => {
-    const timeUpdateInterval = setInterval(() => {
-      setRecentAttacks(prev => prev.map((attack, index) => ({
-        ...attack,
-        time: index === 0 ? "Just now" : 
-              index < 3 ? `${index + 1} min ago` : 
-              `${Math.floor((index + 1) * 2.5)} min ago`
-      })))
-    }, 60000) // Update every minute
-
-    return () => clearInterval(timeUpdateInterval)
+    const candidateTimestamp = lastTimestamp ?? sortedAttacks[0]?.timestamp
+    if (candidateTimestamp) {
+      const parsed = Date.parse(candidateTimestamp)
+      setLastUpdate(Number.isNaN(parsed) ? new Date() : new Date(parsed))
+    } else {
+      setLastUpdate(new Date())
+    }
   }, [])
+
+  const fetchLatestData = useCallback(async () => {
+    try {
+      const [eventsResponse, countResponse] = await Promise.all([
+        supabase
+          .from("attacker_logs")
+          .select("*")
+          .order("timestamp", { ascending: false })
+          .limit(MAX_STORED_EVENTS),
+        supabase
+          .from("attacker_logs")
+          .select("*", { count: "exact", head: true })
+      ])
+
+      if (eventsResponse.error) {
+        console.error("Failed to load attacker logs", eventsResponse.error)
+        return
+      }
+
+      if (countResponse.error) {
+        console.error("Failed to load attacker log count", countResponse.error)
+      }
+
+      const normalized = (eventsResponse.data ?? [])
+        .map(item => normalizeAttackRecord(item as GenericRecord))
+        .filter((attack): attack is AttackEvent => Boolean(attack))
+
+      const totalCount = typeof countResponse.count === "number"
+        ? countResponse.count
+        : normalized.length
+
+      applyAttackData(normalized, totalCount)
+      lastHeartbeatRef.current = Date.now()
+    } catch (error) {
+      console.error("Unexpected error while loading attacker logs", error)
+    }
+  }, [applyAttackData])
+
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true)
+    try {
+      await fetchLatestData()
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [fetchLatestData])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const subscribeToRealtime = () => {
+      if (cancelled) return
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current)
+        channelRef.current = null
+      }
+
+      updateHoneypotStatus("connecting")
+      setIsConnected(false)
+      lastHeartbeatRef.current = Date.now()
+
+      const channel = supabase.channel("public:attacker_logs")
+      channelRef.current = channel
+
+      channel.on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "attacker_logs" },
+        (payload: RealtimePostgresInsertPayload<GenericRecord>) => {
+          if (cancelled || !isMountedRef.current) return
+          const attack = normalizeAttackRecord(payload.new)
+          if (!attack) return
+
+          const alreadyKnown = allAttacksRef.current.some(existing => existing.id === attack.id)
+          if (alreadyKnown) return
+
+          const nextTotal = totalEventCountRef.current + 1
+          const combined = [attack, ...allAttacksRef.current]
+          applyAttackData(combined, nextTotal, attack.timestamp)
+          lastHeartbeatRef.current = Date.now()
+        }
+      )
+
+      channel.subscribe(status => {
+        if (cancelled || !isMountedRef.current) return
+        if (status === "SUBSCRIBED") {
+          setIsConnected(true)
+          updateHoneypotStatus("active")
+          lastHeartbeatRef.current = Date.now()
+          void fetchLatestData()
+        } else if (status === "CHANNEL_ERROR" || status === "CLOSED" || status === "TIMED_OUT") {
+          setIsConnected(false)
+          updateHoneypotStatus("reconnecting")
+          if (!reconnectTimeoutRef.current) {
+            reconnectTimeoutRef.current = setTimeout(() => {
+              reconnectTimeoutRef.current = null
+              subscribeToRealtime()
+            }, 3000)
+          }
+        }
+      })
+    }
+
+    const startHeartbeat = () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current)
+      }
+
+      heartbeatIntervalRef.current = setInterval(() => {
+        if (cancelled) return
+        const channel = channelRef.current
+        if (!channel) {
+          if (!reconnectTimeoutRef.current) {
+            updateHoneypotStatus("reconnecting")
+            reconnectTimeoutRef.current = setTimeout(() => {
+              reconnectTimeoutRef.current = null
+              subscribeToRealtime()
+            }, 2000)
+          }
+          return
+        }
+
+        if ((channel as RealtimeChannel).state !== "joined") {
+          setIsConnected(false)
+          updateHoneypotStatus("reconnecting")
+          if (!reconnectTimeoutRef.current) {
+            reconnectTimeoutRef.current = setTimeout(() => {
+              reconnectTimeoutRef.current = null
+              subscribeToRealtime()
+            }, 2000)
+          }
+          return
+        }
+
+        const now = Date.now()
+        if (now - lastHeartbeatRef.current > 60000) {
+          setIsConnected(false)
+          updateHoneypotStatus("reconnecting")
+          if (!reconnectTimeoutRef.current) {
+            reconnectTimeoutRef.current = setTimeout(() => {
+              reconnectTimeoutRef.current = null
+              subscribeToRealtime()
+            }, 2000)
+          }
+          return
+        }
+
+        channel
+          .send({ type: "broadcast", event: "heartbeat", payload: { timestamp: now } })
+          .then(result => {
+            if (cancelled) return
+            if (result !== "ok") {
+              setIsConnected(false)
+              updateHoneypotStatus("reconnecting")
+              if (!reconnectTimeoutRef.current) {
+                reconnectTimeoutRef.current = setTimeout(() => {
+                  reconnectTimeoutRef.current = null
+                  subscribeToRealtime()
+                }, 2000)
+              }
+            } else {
+              lastHeartbeatRef.current = now
+            }
+          })
+          .catch(error => {
+            if (cancelled) return
+            console.warn("Heartbeat failed, attempting resubscribe", error)
+            setIsConnected(false)
+            updateHoneypotStatus("reconnecting")
+            if (!reconnectTimeoutRef.current) {
+              reconnectTimeoutRef.current = setTimeout(() => {
+                reconnectTimeoutRef.current = null
+                subscribeToRealtime()
+              }, 2000)
+            }
+          })
+      }, 20000)
+    }
+
+    fetchLatestData()
+    subscribeToRealtime()
+    startHeartbeat()
+
+    return () => {
+      cancelled = true
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current)
+        heartbeatIntervalRef.current = null
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current)
+        channelRef.current = null
+      }
+    }
+  }, [applyAttackData, fetchLatestData, updateHoneypotStatus])
+
+  const connectionLabel = isConnected
+    ? "Live"
+    : threatData.honeypotStatus === "reconnecting"
+      ? "Reconnecting"
+      : "Connecting..."
+
+  const connectionBadgeClass = isConnected ? "text-green-600" : "text-orange-600"
+
+  const highSeverityCount = severitySummary.high + severitySummary.critical
+  const protocolTotal = protocolStats.reduce((total, stat) => total + stat.count, 0)
+  const maxTimelineCount = timelineBuckets.reduce((max, bucket) => Math.max(max, bucket.count), 0)
 
   return (
     <SidebarProvider>
@@ -195,35 +685,32 @@ export default function Page() {
             </Breadcrumb>
           </div>
           <div className="ml-auto flex items-center gap-2 px-4">
-            <Badge variant="outline" className={isConnected ? "text-green-600" : "text-orange-600"}>
-              <Activity className={`w-3 h-3 mr-1 ${isConnected ? 'animate-pulse' : ''}`} />
-              {isConnected ? 'Live' : 'Connecting...'}
+            <Badge variant="outline" className={connectionBadgeClass}>
+              <Activity className={`w-3 h-3 mr-1 ${isConnected ? "animate-pulse" : ""}`} />
+              {connectionLabel}
             </Badge>
-            <Button 
-              variant="outline" 
-              size="sm" 
+            <Button
+              variant="outline"
+              size="sm"
               onClick={handleRefresh}
               disabled={isRefreshing}
             >
-              <RefreshCw className={`w-4 h-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-4 h-4 mr-1 ${isRefreshing ? "animate-spin" : ""}`} />
               Refresh
             </Button>
           </div>
         </header>
 
         <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
-          {/* Status Alert */}
           <Alert className={isConnected ? "border-green-200 bg-green-50" : "border-orange-200 bg-orange-50"}>
-            <Shield className={`h-4 w-4 ${isConnected ? 'text-green-600' : 'text-orange-600'}`} />
+            <Shield className={`h-4 w-4 ${isConnected ? "text-green-600" : "text-orange-600"}`} />
             <AlertDescription className={isConnected ? "text-green-800" : "text-orange-800"}>
-              {isConnected 
-                ? `All honeypot services are operational. Last updated: ${lastUpdate.toLocaleTimeString()}`
-                : "Establishing connection to honeypot network..."
-              }
+              {isConnected
+                ? `All honeypot services are operational. Last updated: ${lastUpdate ? lastUpdate.toLocaleTimeString() : "—"}`
+                : "Establishing connection to honeypot network..."}
             </AlertDescription>
           </Alert>
 
-          {/* Key Metrics Cards */}
           <div className="grid auto-rows-min gap-4 md:grid-cols-4">
             <Card>
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -233,30 +720,30 @@ export default function Page() {
               <CardContent>
                 <div className="text-2xl font-bold text-red-600 font-mono">{threatData.activeThreats}</div>
                 <p className="text-xs text-muted-foreground">
-                  {threatData.activeThreats > 20 ? '+High activity' : '+Normal activity'}
+                  Observed within last {ACTIVE_WINDOW_MINUTES} minutes
                 </p>
               </CardContent>
             </Card>
 
             <Card>
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium">Blocked Attempts</CardTitle>
+                <CardTitle className="text-sm font-medium">Captured Events</CardTitle>
                 <Shield className="h-4 w-4 text-green-500" />
               </CardHeader>
               <CardContent>
                 <div className="text-2xl font-bold text-green-600 font-mono">{threatData.blockedAttempts.toLocaleString()}</div>
-                <p className="text-xs text-muted-foreground">+{Math.floor(Math.random() * 50) + 10} in last hour</p>
+                <p className="text-xs text-muted-foreground">Total honeypot interactions recorded</p>
               </CardContent>
             </Card>
 
             <Card>
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium">Connected Attackers</CardTitle>
+                <CardTitle className="text-sm font-medium">Unique Attackers</CardTitle>
                 <Users className="h-4 w-4 text-orange-500" />
               </CardHeader>
               <CardContent>
                 <div className="text-2xl font-bold text-orange-600 font-mono">{threatData.connectedAttackers}</div>
-                <p className="text-xs text-muted-foreground">Currently active sessions</p>
+                <p className="text-xs text-muted-foreground">Distinct source IPs observed</p>
               </CardContent>
             </Card>
 
@@ -268,15 +755,13 @@ export default function Page() {
               <CardContent>
                 <div className="text-2xl font-bold text-blue-600 capitalize">{threatData.honeypotStatus}</div>
                 <p className="text-xs text-muted-foreground">
-                  {isConnected ? '12 services running' : 'Connecting...'}
+                  {isConnected ? "Realtime feed established" : "Waiting for live telemetry"}
                 </p>
               </CardContent>
             </Card>
           </div>
 
-          {/* Main Dashboard Content */}
           <div className="grid gap-4 md:grid-cols-3">
-            {/* Real-time Activity Feed */}
             <Card className="md:col-span-2">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -294,27 +779,24 @@ export default function Page() {
                     {recentAttacks.length > 0 ? recentAttacks.map((attack) => (
                       <div key={attack.id} className="flex items-center justify-between p-3 border rounded-lg hover:bg-muted/50 transition-colors">
                         <div className="flex items-center gap-3">
-                          <Badge 
-                            variant={attack.severity === 'high' ? 'destructive' : attack.severity === 'medium' ? 'default' : 'secondary'}
-                          >
-                            {attack.severity}
+                          <Badge variant={severityVariant(attack.severity)}>
+                            {severityLabelMap[attack.severity]}
                           </Badge>
                           <div>
                             <p className="font-medium">{attack.type}</p>
                             <p className="text-sm text-muted-foreground font-mono">
-                              {attack.ip}:{attack.port} • {attack.country}
+                              {attack.ip}{attack.port !== "—" ? `:${attack.port}` : ""} • {attack.country}
                             </p>
                           </div>
                         </div>
                         <div className="text-right">
                           <p className="text-sm text-muted-foreground flex items-center gap-1">
                             <Clock className="h-3 w-3" />
-                            {attack.time}
+                            {formatRelativeTime(attack.timestamp)}
                           </p>
-                          <Button variant="outline" size="sm" className="mt-1">
-                            <Eye className="h-3 w-3 mr-1" />
-                            Details
-                          </Button>
+                          <p className="text-xs text-muted-foreground mt-1 line-clamp-1" title={attack.userAgent}>
+                            {attack.userAgent}
+                          </p>
                         </div>
                       </div>
                     )) : (
@@ -328,7 +810,6 @@ export default function Page() {
               </CardContent>
             </Card>
 
-            {/* Geographic Distribution */}
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -339,7 +820,7 @@ export default function Page() {
               </CardHeader>
               <CardContent>
                 <div className="space-y-4">
-                  {topCountries.map((country, index) => (
+                  {topCountries.length > 0 ? topCountries.map((country, index) => (
                     <div key={index} className="space-y-2">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
@@ -348,15 +829,16 @@ export default function Page() {
                         </div>
                         <span className="text-sm text-muted-foreground font-mono">{country.attacks}</span>
                       </div>
-                      <Progress value={country.percentage} className="h-2" />
+                      <Progress value={Math.min(country.percentage, 100)} className="h-2" />
                     </div>
-                  ))}
+                  )) : (
+                    <p className="text-sm text-muted-foreground text-center py-6">No geographic data available yet.</p>
+                  )}
                 </div>
               </CardContent>
             </Card>
           </div>
 
-          {/* Detailed Analytics Tabs */}
           <Card>
             <CardContent className="p-6">
               <Tabs defaultValue="network" className="w-full">
@@ -366,74 +848,87 @@ export default function Page() {
                   <TabsTrigger value="payloads">Payloads</TabsTrigger>
                   <TabsTrigger value="timeline">Timeline</TabsTrigger>
                 </TabsList>
-                
+
                 <TabsContent value="network" className="mt-4">
                   <div className="space-y-4">
                     <div className="grid grid-cols-3 gap-4">
                       <div className="text-center p-4 border rounded">
-                        <p className="text-2xl font-bold">{Math.floor(Math.random() * 1000) + 500}</p>
-                        <p className="text-sm text-muted-foreground">TCP Connections</p>
+                        <p className="text-2xl font-bold">{threatData.activeThreats}</p>
+                        <p className="text-sm text-muted-foreground">Active (last {ACTIVE_WINDOW_MINUTES}m)</p>
                       </div>
                       <div className="text-center p-4 border rounded">
-                        <p className="text-2xl font-bold">{Math.floor(Math.random() * 200) + 50}</p>
-                        <p className="text-sm text-muted-foreground">UDP Packets</p>
+                        <p className="text-2xl font-bold">{threatData.blockedAttempts}</p>
+                        <p className="text-sm text-muted-foreground">Total events captured</p>
                       </div>
                       <div className="text-center p-4 border rounded">
-                        <p className="text-2xl font-bold">{Math.floor(Math.random() * 50) + 10}</p>
-                        <p className="text-sm text-muted-foreground">Unique IPs</p>
+                        <p className="text-2xl font-bold">{threatData.connectedAttackers}</p>
+                        <p className="text-sm text-muted-foreground">Unique attacker IPs</p>
                       </div>
                     </div>
-                    <div className="h-[200px] flex items-center justify-center border-2 border-dashed rounded-lg">
-                      <p className="text-muted-foreground">Real-time network chart integration ready</p>
+                    <div className="flex justify-around text-center">
+                      {(["critical", "high", "medium", "low"] as Severity[]).map(level => (
+                        <div key={level}>
+                          <p className="text-lg font-semibold">{severitySummary[level]}</p>
+                          <p className="text-xs uppercase text-muted-foreground">{severityLabelMap[level]}</p>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </TabsContent>
-                
+
                 <TabsContent value="protocols" className="mt-4">
                   <div className="space-y-3">
-                    {['SSH (22)', 'HTTP (80)', 'HTTPS (443)', 'FTP (21)', 'Telnet (23)'].map((protocol, index) => (
-                      <div key={protocol} className="flex justify-between items-center p-3 border rounded">
-                        <span className="font-medium">{protocol}</span>
+                    {protocolStats.length > 0 ? protocolStats.map(protocol => (
+                      <div key={protocol.type} className="flex justify-between items-center p-3 border rounded">
+                        <span className="font-medium">{protocol.type}</span>
                         <div className="flex items-center gap-2">
-                          <Progress value={Math.random() * 100} className="w-24 h-2" />
-                          <span className="text-sm text-muted-foreground font-mono">
-                            {Math.floor(Math.random() * 200) + 10}
-                          </span>
+                          <Progress value={protocolTotal > 0 ? (protocol.count / protocolTotal) * 100 : 0} className="w-24 h-2" />
+                          <span className="text-sm text-muted-foreground font-mono">{protocol.count}</span>
                         </div>
                       </div>
-                    ))}
+                    )) : (
+                      <p className="text-sm text-muted-foreground text-center py-6">No protocol activity captured yet.</p>
+                    )}
                   </div>
                 </TabsContent>
-                
+
                 <TabsContent value="payloads" className="mt-4">
                   <div className="space-y-3">
                     <Alert>
                       <AlertTriangle className="h-4 w-4" />
                       <AlertDescription>
-                        {Math.floor(Math.random() * 15) + 5} malicious payloads detected in the last hour
+                        {highSeverityCount} high-risk payloads detected across recent events
                       </AlertDescription>
                     </Alert>
-                    <div className="h-[200px] flex items-center justify-center border-2 border-dashed rounded-lg">
-                      <p className="text-muted-foreground">Payload analysis visualization ready</p>
+                    <div className="space-y-2">
+                      {highSeveritySamples.length > 0 ? highSeveritySamples.map((sample, index) => (
+                        <div key={index} className="p-3 border rounded bg-muted/30">
+                          <code className="text-xs break-words">{sample}</code>
+                        </div>
+                      )) : (
+                        <p className="text-sm text-muted-foreground text-center py-6">No high-risk payloads observed yet.</p>
+                      )}
                     </div>
                   </div>
                 </TabsContent>
-                
+
                 <TabsContent value="timeline" className="mt-4">
                   <div className="space-y-3">
-                    {Array.from({ length: 5 }, (_, i) => (
-                      <div key={i} className="flex items-center gap-4 p-3 border rounded">
+                    {timelineBuckets.length > 0 ? timelineBuckets.map(bucket => (
+                      <div key={bucket.iso} className="flex items-center gap-4 p-3 border rounded">
                         <div className="text-sm text-muted-foreground font-mono">
-                          {new Date(Date.now() - i * 300000).toLocaleTimeString()}
+                          {bucket.label}
                         </div>
                         <Badge variant="outline">
-                          {Math.floor(Math.random() * 20) + 5} events
+                          {bucket.count} events
                         </Badge>
                         <div className="flex-1">
-                          <Progress value={Math.random() * 100} className="h-2" />
+                          <Progress value={maxTimelineCount > 0 ? (bucket.count / maxTimelineCount) * 100 : 0} className="h-2" />
                         </div>
                       </div>
-                    ))}
+                    )) : (
+                      <p className="text-sm text-muted-foreground text-center py-6">Timeline will populate as events arrive.</p>
+                    )}
                   </div>
                 </TabsContent>
               </Tabs>
