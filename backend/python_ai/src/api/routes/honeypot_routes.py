@@ -94,16 +94,60 @@ async def call_gemini_api(prompt_text: str) -> str:
         print(f"  [Gemini API] Fehler beim Aufruf der Gemini API: {e}")
         raise # Fehler für Tenacity erneut werfen
 
-def identify_attack_indicators(log: HoneypotLog) -> List[str]:
-    """Analysiert einen Honeypot-Logeintrag auf häufige Angriffsindikatoren."""
+def identify_attack_indicators(log: HoneypotLog) -> Dict[str, Any]:
+    """Analysiert einen Honeypot-Logeintrag und leitet heuristische Zusatzinformationen ab."""
 
     indicators: List[str] = []
     honeypot_type = (log.honeypot_type or "").lower()
     interaction_data = log.interaction_data or {}
 
+    scanner_type = "unidentified"
+    scan_pattern = "unknown"
+    pattern_priority = 0
+    tool_confidence = 0.2
+    threat_score = 0
+    is_real_browser = False
+
     def add_indicator(name: str) -> None:
         if name not in indicators:
             indicators.append(name)
+
+    def update_pattern(pattern: str, priority: int) -> None:
+        nonlocal scan_pattern, pattern_priority
+        if priority >= pattern_priority:
+            scan_pattern = pattern
+            pattern_priority = priority
+
+    def register_scanner(label: str, confidence: float = 0.85, *, add_known_indicator: bool = True) -> None:
+        nonlocal scanner_type, tool_confidence, threat_score
+        if add_known_indicator:
+            add_indicator("Known Scanner")
+        if scanner_type == "unidentified":
+            scanner_type = label
+        tool_confidence = max(tool_confidence, confidence)
+        threat_score += 2
+
+    def try_float(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    def try_int(value: Any) -> Optional[int]:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
 
     if honeypot_type == "http":
         request_path = (interaction_data.get("request_path") or "").lower()
@@ -114,6 +158,9 @@ def identify_attack_indicators(log: HoneypotLog) -> List[str]:
         directory_traversal_markers = ["../", "..\\", "%2e%2e", "%252e%252e", "/etc/passwd", "c:/windows"]
         if any(marker in decoded_path for marker in directory_traversal_markers):
             add_indicator("Directory Traversal")
+            threat_score += 3
+            tool_confidence = max(tool_confidence, 0.75)
+            update_pattern("directory-traversal", 5)
 
         method = (interaction_data.get("method") or "").upper()
         parsed_body = interaction_data.get("parsed_body")
@@ -143,22 +190,68 @@ def identify_attack_indicators(log: HoneypotLog) -> List[str]:
             (username and password) or credential_lists_present
         ):
             add_indicator("Credential-Stuffing")
+            threat_score += 2
+            tool_confidence = max(tool_confidence, 0.7)
+            update_pattern("credential-stuffing", 4)
 
         user_agent = (interaction_data.get("user_agent") or "").lower()
-        known_http_scanners = [
-            "nmap",
-            "masscan",
-            "nikto",
-            "acunetix",
-            "nessus",
-            "sqlmap",
-            "wpscan",
-            "gobuster",
-            "dirbuster",
-            "shodan",
-        ]
-        if any(scanner in user_agent for scanner in known_http_scanners):
-            add_indicator("Known Scanner")
+        known_http_scanners = {
+            "nmap": "Nmap",
+            "masscan": "Masscan",
+            "nikto": "Nikto",
+            "acunetix": "Acunetix",
+            "nessus": "Nessus",
+            "sqlmap": "SQLMap",
+            "wpscan": "Wpscan",
+            "gobuster": "Gobuster",
+            "dirbuster": "Dirbuster",
+            "shodan": "Shodan",
+            "curl": "cURL",
+            "wget": "Wget",
+            "python-requests": "Python Requests",
+        }
+        headless_signatures = ["headless", "phantomjs", "selenium", "httpclient", "java/", "bot"]
+        browser_signatures = ["chrome", "firefox", "safari", "edge", "opr", "trident", "msie"]
+
+        detected_scanner = False
+        for signature, label in known_http_scanners.items():
+            if signature in user_agent:
+                register_scanner(label)
+                update_pattern("reconnaissance", 2)
+                detected_scanner = True
+                break
+
+        if not detected_scanner and any(marker in user_agent for marker in headless_signatures):
+            register_scanner("Headless/Scripted Client", 0.8, add_known_indicator=False)
+            update_pattern("automation", 1)
+            detected_scanner = True
+
+        if not detected_scanner and user_agent:
+            if any(marker in user_agent for marker in browser_signatures):
+                is_real_browser = True
+                scanner_type = "Browser"
+                tool_confidence = max(tool_confidence, 0.5)
+                update_pattern("probing", 1)
+            else:
+                update_pattern("probing", 1)
+
+        request_count = try_int(interaction_data.get("request_count"))
+        avg_interval_ms = try_float(interaction_data.get("average_interval_ms"))
+
+        if request_count and request_count >= 50:
+            threat_score += 1
+            tool_confidence = max(tool_confidence, 0.65)
+            update_pattern("sweeping-scan", 3)
+        elif request_count and request_count >= 10:
+            update_pattern("multi-request", 2)
+
+        if avg_interval_ms is not None:
+            if avg_interval_ms <= 250:
+                threat_score += 1
+                tool_confidence = max(tool_confidence, 0.7)
+                update_pattern("rapid-scan", 3)
+            elif avg_interval_ms >= 2000 and pattern_priority < 3:
+                update_pattern("slow-probing", 2)
 
     elif honeypot_type == "ssh":
         username_attempt = (interaction_data.get("username_attempt") or "").lower()
@@ -168,23 +261,71 @@ def identify_attack_indicators(log: HoneypotLog) -> List[str]:
         common_usernames = {"root", "admin", "administrator", "test", "guest", "pi"}
         weak_passwords = {"123456", "password", "admin", "root", "toor", "qwerty"}
 
-        if (
+        bruteforce_detected = (
             username_attempt in common_usernames
             or (isinstance(password_attempt, str) and password_attempt.lower() in weak_passwords)
             or (isinstance(authentication_failures, int) and authentication_failures >= 3)
-        ):
+        )
+
+        if bruteforce_detected:
             add_indicator("SSH-Bruteforce")
+            threat_score += 3
+            tool_confidence = max(tool_confidence, 0.8)
+            update_pattern("ssh-bruteforce", 5)
 
         client_banner = (interaction_data.get("client_banner") or "").lower()
-        known_ssh_scanners = ["nmap", "masscan", "shodan", "libssh", "sshlib", "paramiko"]
-        if any(scanner in client_banner for scanner in known_ssh_scanners):
-            add_indicator("Known Scanner")
+        known_ssh_scanners = {
+            "nmap": "Nmap",
+            "masscan": "Masscan",
+            "shodan": "Shodan",
+            "libssh": "libssh",
+            "sshlib": "SSHLib",
+            "paramiko": "Paramiko",
+        }
+        for signature, label in known_ssh_scanners.items():
+            if signature in client_banner:
+                register_scanner(label)
+                update_pattern("reconnaissance", 2)
+                break
 
-    return indicators
+        command_executed = (interaction_data.get("command_executed") or "").lower()
+        suspicious_commands = ["wget", "curl", "nc", "ncat", "python", "perl", "bash", "sh", "chmod", "echo"]
+        if any(cmd in command_executed for cmd in suspicious_commands):
+            threat_score += 1
+            tool_confidence = max(tool_confidence, 0.75)
+            update_pattern("post-exploitation", 4)
+
+        session_duration = try_float(interaction_data.get("session_duration_ms"))
+        if session_duration and session_duration > 300000:  # > 5 Minuten
+            update_pattern("persistent-access", 3)
+
+    scanner_type = "unknown" if scanner_type == "unidentified" else scanner_type
+    tool_confidence = round(min(tool_confidence, 1.0), 2)
+
+    if threat_score >= 6:
+        threat_level = "critical"
+    elif threat_score >= 4:
+        threat_level = "high"
+    elif threat_score >= 2:
+        threat_level = "medium"
+    else:
+        threat_level = "low"
+
+    return {
+        "indicators": indicators,
+        "scanner_type": scanner_type,
+        "tool_confidence": tool_confidence,
+        "threat_level": threat_level,
+        "is_real_browser": bool(is_real_browser),
+        "scan_pattern": scan_pattern,
+    }
 
 
 # Funktion zur Generierung von LLM-basierter Desinformation
-async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, Any], str]:
+async def generate_disinformation_llm(
+    log: HoneypotLog,
+    analysis_result: Optional[Dict[str, Any]] = None
+) -> Tuple[str, Dict[str, Any], str]:
     """
     Generiert Desinformation mithilfe eines Large Language Models (LLM).
     """
@@ -279,7 +420,8 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
     \n\nGeneriere eine detaillierte, mehrschichtige Täuschungsantwort basierend auf allen oben genannten Informationen. Sei kreativ und führe den Angreifer mit glaubwürdigen, aber falschen Details in die Irre. Dein Ziel ist es, ihn zu beschäftigen und seine Ressourcen zu verschwenden.
     """
 
-    analysis_indicators = identify_attack_indicators(log)
+    analysis_result = analysis_result or identify_attack_indicators(log)
+    analysis_indicators = analysis_result.get("indicators", [])
 
     disinformation_content = "KI konnte keine plausible Desinformation generieren." # Fallback
 
@@ -296,6 +438,13 @@ async def generate_disinformation_llm(log: HoneypotLog) -> Tuple[str, Dict[str, 
         "source_ip": log.source_ip,
         "analysis_triggered_by": "LLM_Generation",
         "analysis_rules_triggered": analysis_indicators,
+        "analysis_metadata": {
+            "scanner_type": analysis_result.get("scanner_type"),
+            "tool_confidence": analysis_result.get("tool_confidence"),
+            "threat_level": analysis_result.get("threat_level"),
+            "is_real_browser": analysis_result.get("is_real_browser"),
+            "scan_pattern": analysis_result.get("scan_pattern"),
+        },
         "llm_prompt": full_prompt, # Speichere den vollen Prompt zu Debugging-Zwecken
         "llm_response_raw": disinformation_content, # Speichere die rohe KI-Antwort
         "generated_timestamp": datetime.now().isoformat()
@@ -341,8 +490,18 @@ async def analyze_and_disinform(log: HoneypotLog, request: Request):
             interaction_details["client_banner"] = cleaned_banner
             cleaned_log_data["interaction_data"] = interaction_details # Aktualisiere im cleaned_log_data
 
+    analysis_result = identify_attack_indicators(log)
+    print(f"  Derived analysis: {json.dumps(analysis_result, indent=2)}")
+
+    # Ergänze berechnete Felder im bereinigten Datensatz
+    cleaned_log_data["scanner_type"] = analysis_result.get("scanner_type")
+    cleaned_log_data["tool_confidence"] = analysis_result.get("tool_confidence")
+    cleaned_log_data["threat_level"] = analysis_result.get("threat_level")
+    cleaned_log_data["is_real_browser"] = analysis_result.get("is_real_browser")
+    cleaned_log_data["scan_pattern"] = analysis_result.get("scan_pattern")
+
     # Desinformation mit LLM generieren (nutzt das originale Log-Objekt, da LLM alle Daten sehen soll)
-    disinformation_content, disinformation_context, ai_model_name = await generate_disinformation_llm(log)
+    disinformation_content, disinformation_context, ai_model_name = await generate_disinformation_llm(log, analysis_result)
 
     print(f"  Generated Desinformation: {disinformation_content}")
     print(f"  Context: {json.dumps(disinformation_context, indent=2)}")

@@ -34,7 +34,8 @@ import {
   RefreshCw,
   MapPin,
   Clock,
-  Zap
+  Zap,
+  Radar
 } from "lucide-react"
 import { useState, useEffect, useCallback, useRef } from "react"
 import { supabase } from "@/supabaseClient"
@@ -73,6 +74,10 @@ type AttackEvent = {
   userAgent: string
   payload: string
   timestamp: string
+  scanner: string
+  scanPattern: string
+  toolConfidence: number | null
+  isRealBrowser: boolean | null
 }
 
 type CountryStat = {
@@ -84,6 +89,12 @@ type CountryStat = {
 type ProtocolStat = {
   type: string
   count: number
+}
+
+type ScannerStat = {
+  label: string
+  count: number
+  percentage: number
 }
 
 type TimelineBucket = {
@@ -237,13 +248,47 @@ function normalizeAttackRecord(raw: GenericRecord): AttackEvent | null {
   const interaction = ensureRecord(raw["interaction_data"])
   const severity = deriveThreatLevel(raw)
   const { key: countryKey, label: countryLabel } = buildCountryLabel(raw)
-  const typeParts = [getStringField(raw, "honeypot_type"), getStringField(raw, "scanner_type")]
+  const scannerRaw = getStringField(raw, "scanner_type")
+  const scannerLabel = !scannerRaw || scannerRaw.toLowerCase() === "unknown"
+    ? "Unidentified"
+    : scannerRaw
+  const scannerForType = scannerRaw && scannerRaw.toLowerCase() !== "unknown"
+    ? scannerRaw
+    : undefined
+  const typeParts = [getStringField(raw, "honeypot_type"), scannerForType]
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .map(value => value.trim())
 
   const type = typeParts.length > 0 ? typeParts.join(" · ") : "Unknown activity"
   const rawThreatLevel = getStringField(raw, "threat_level")
   const threatLevelLabel = rawThreatLevel ?? severityLabelMap[severity]
+
+  const scanPatternRaw = getStringField(raw, "scan_pattern")
+  const scanPattern = scanPatternRaw && scanPatternRaw.trim()
+    ? scanPatternRaw.trim()
+    : "unknown"
+
+  const confidenceValue = raw["tool_confidence"]
+  let toolConfidence: number | null = null
+  if (typeof confidenceValue === "number" && Number.isFinite(confidenceValue)) {
+    toolConfidence = confidenceValue
+  } else if (typeof confidenceValue === "string") {
+    const parsed = Number(confidenceValue)
+    toolConfidence = Number.isNaN(parsed) ? null : parsed
+  }
+
+  const rawBrowserFlag = raw["is_real_browser"]
+  let isRealBrowser: boolean | null = null
+  if (typeof rawBrowserFlag === "boolean") {
+    isRealBrowser = rawBrowserFlag
+  } else if (typeof rawBrowserFlag === "string") {
+    const lowered = rawBrowserFlag.trim().toLowerCase()
+    if (lowered === "true") {
+      isRealBrowser = true
+    } else if (lowered === "false") {
+      isRealBrowser = false
+    }
+  }
 
   const timestamp = new Date(timestampValue).toISOString()
 
@@ -260,7 +305,11 @@ function normalizeAttackRecord(raw: GenericRecord): AttackEvent | null {
     port: extractPort(raw, interaction),
     userAgent: extractUserAgent(interaction),
     payload: extractPayload(interaction),
-    timestamp
+    timestamp,
+    scanner: scannerLabel,
+    scanPattern,
+    toolConfidence,
+    isRealBrowser
   }
 }
 
@@ -301,6 +350,76 @@ function buildProtocolStats(attacks: AttackEvent[]): ProtocolStat[] {
     .map(([type, count]) => ({ type, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 6)
+}
+
+function buildScannerStats(attacks: AttackEvent[]): ScannerStat[] {
+  if (attacks.length === 0) return []
+  const counts = new Map<string, number>()
+  for (const attack of attacks) {
+    const raw = attack.scanner?.trim() ?? "Unidentified"
+    const label = raw.length > 0 ? raw : "Unidentified"
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  const total = attacks.length
+  return Array.from(counts.entries())
+    .map(([label, count]) => ({
+      label,
+      count,
+      percentage: total > 0 ? (count / total) * 100 : 0,
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5)
+}
+
+function humanizePattern(pattern: string): string {
+  if (!pattern) return "Unknown"
+  const trimmed = pattern.trim()
+  if (!trimmed) return "Unknown"
+  if (trimmed.toLowerCase() === "unknown") return "Unknown"
+  return trimmed
+    .replace(/[-_]+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map(word => word[0]?.toUpperCase() + word.slice(1))
+    .join(" ")
+}
+
+function buildPatternStats(attacks: AttackEvent[]): ScannerStat[] {
+  if (attacks.length === 0) return []
+  const counts = new Map<string, number>()
+  for (const attack of attacks) {
+    const normalized = attack.scanPattern?.trim() ?? "unknown"
+    const key = normalized.length > 0 ? normalized.toLowerCase() : "unknown"
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  const total = attacks.length
+  return Array.from(counts.entries())
+    .map(([key, count]) => ({
+      label: humanizePattern(key),
+      count,
+      percentage: total > 0 ? (count / total) * 100 : 0,
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5)
+}
+
+function computeBrowserShare(attacks: AttackEvent[]): number {
+  if (attacks.length === 0) return 0
+  const browserLike = attacks.reduce((total, attack) => {
+    return attack.isRealBrowser ? total + 1 : total
+  }, 0)
+  return browserLike / attacks.length
+}
+
+function computeAverageConfidence(attacks: AttackEvent[]): number | null {
+  const values = attacks
+    .map(attack => attack.toolConfidence)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+
+  if (values.length === 0) return null
+
+  const total = values.reduce((sum, value) => sum + value, 0)
+  return total / values.length
 }
 
 function buildTimelineBuckets(attacks: AttackEvent[]): TimelineBucket[] {
@@ -638,8 +757,14 @@ export default function Page() {
     medium: 0,
     low: 0
   })
-  const [highSeveritySamples, setHighSeveritySamples] = useState<string[]>([])
+  const [highSeveritySamples, setHighSeveritySamples] = useState<string[]>([]
+  const [scannerStats, setScannerStats] = useState<ScannerStat[]>([])
+  const [patternStats, setPatternStats] = useState<ScannerStat[]>([])
+  const [browserShare, setBrowserShare] = useState<number>(0)
+  const [averageConfidence, setAverageConfidence] = useState<number | null>(null)
+
   const [disinformationEntries, setDisinformationEntries] = useState<DisinformationEntry[]>([])
+
   const [isConnected, setIsConnected] = useState(false)
 
   const isMountedRef = useRef(false)
@@ -728,6 +853,10 @@ export default function Page() {
     setTimelineBuckets(buildTimelineBuckets(sortedAttacks))
     setSeveritySummary(buildThreatSummary(sortedAttacks))
     setHighSeveritySamples(collectHighSeverityPayloads(sortedAttacks))
+    setScannerStats(buildScannerStats(sortedAttacks))
+    setPatternStats(buildPatternStats(sortedAttacks))
+    setBrowserShare(computeBrowserShare(sortedAttacks))
+    setAverageConfidence(computeAverageConfidence(sortedAttacks))
     setThreatData(prev => ({
       ...prev,
       activeThreats: computeActiveThreats(sortedAttacks),
@@ -1041,6 +1170,13 @@ export default function Page() {
   const highSeverityCount = severitySummary.high + severitySummary.critical
   const protocolTotal = protocolStats.reduce((total, stat) => total + stat.count, 0)
   const maxTimelineCount = timelineBuckets.reduce((max, bucket) => Math.max(max, bucket.count), 0)
+  const scannerTotal = scannerStats.reduce((total, stat) => total + stat.count, 0)
+  const patternTotal = patternStats.reduce((total, stat) => total + stat.count, 0)
+  const browserPercentage = Math.round(Math.min(Math.max(browserShare, 0), 1) * 100)
+  const automationPercentage = 100 - browserPercentage
+  const averageConfidencePercentage = averageConfidence !== null
+    ? Math.round(Math.min(Math.max(averageConfidence, 0), 1) * 100)
+    : null
 
   return (
     <SidebarProvider>
@@ -1144,7 +1280,7 @@ export default function Page() {
             </Card>
           </div>
 
-          <div className="grid gap-4 md:grid-cols-3">
+          <div className="grid gap-4 md:grid-cols-4">
             <Card className="md:col-span-2">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -1174,6 +1310,18 @@ export default function Page() {
                             <p className="text-sm text-muted-foreground font-mono">
                               {attack.ip}{attack.port !== "—" ? `:${attack.port}` : ""} • {attack.country}
                             </p>
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              {attack.scanPattern !== "unknown" && (
+                                <Badge variant="outline" className="text-[10px] uppercase tracking-wide">
+                                  {humanizePattern(attack.scanPattern)}
+                                </Badge>
+                              )}
+                              {attack.toolConfidence !== null && (
+                                <span className="text-xs text-muted-foreground font-mono">
+                                  {Math.round(Math.min(Math.max(attack.toolConfidence, 0), 1) * 100)}% confidence
+                                </span>
+                              )}
+                            </div>
                           </div>
                         </div>
                         <div className="text-right">
@@ -1221,6 +1369,78 @@ export default function Page() {
                   )) : (
                     <p className="text-sm text-muted-foreground text-center py-6">No geographic data available yet.</p>
                   )}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Radar className="h-5 w-5" />
+                  Scanner Insights
+                </CardTitle>
+                <CardDescription>Automation signals from recent honeypot hits</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs uppercase text-muted-foreground mb-1">Automation share</p>
+                    <div className="flex items-center gap-2">
+                      <Progress value={automationPercentage} className="h-2 flex-1" />
+                      <span className="text-sm font-mono">{automationPercentage}%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Browser-like traffic: {browserPercentage}%
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-xs uppercase text-muted-foreground mb-1">Avg. tool confidence</p>
+                    {averageConfidencePercentage !== null ? (
+                      <div className="flex items-center gap-2">
+                        <Progress value={averageConfidencePercentage} className="h-2 flex-1" />
+                        <span className="text-sm font-mono">{averageConfidencePercentage}%</span>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Not enough data yet.</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <p className="text-xs uppercase text-muted-foreground mb-2">Top scanners</p>
+                    {scannerStats.length > 0 ? (
+                      <div className="space-y-2">
+                        {scannerStats.map(scanner => (
+                          <div key={scanner.label} className="flex items-center justify-between">
+                            <span className="text-sm font-medium">{scanner.label}</span>
+                            <span className="text-xs text-muted-foreground font-mono">
+                              {scanner.count}{scannerTotal > 0 ? ` · ${Math.round(scanner.percentage)}%` : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Awaiting scanner telemetry.</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <p className="text-xs uppercase text-muted-foreground mb-2">Scan patterns</p>
+                    {patternStats.length > 0 ? (
+                      <div className="space-y-2">
+                        {patternStats.map(pattern => (
+                          <div key={pattern.label} className="flex items-center justify-between">
+                            <span className="text-sm">{pattern.label}</span>
+                            <span className="text-xs text-muted-foreground font-mono">
+                              {pattern.count}{patternTotal > 0 ? ` · ${Math.round(pattern.percentage)}%` : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">No pattern classification yet.</p>
+                    )}
+                  </div>
                 </div>
               </CardContent>
             </Card>
