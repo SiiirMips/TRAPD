@@ -35,3 +35,20 @@ npm run build
 ```
 
 Für die lokale Entwicklung (`npm run dev`) greift das Frontend automatisch auf die lokalen Supabase-Fallback-Werte zurück, falls die Variablen nicht gesetzt sind.
+
+## Alle Services auf einmal starten
+
+Im Projektwurzelverzeichnis steht jetzt ein Skript `./start_all.sh` bereit, das auf Wunsch alle relevanten Komponenten für die lokale Entwicklung hochfährt:
+
+```bash
+./start_all.sh
+```
+
+Das Skript versucht dabei automatisch folgende Dienste zu starten (sofern die benötigten Abhängigkeiten installiert sind):
+
+- Supabase (per `supabase start` – benötigt die [Supabase CLI](https://supabase.com/docs/guides/cli))
+- Python KI-Backend (`backend/python_ai`, via `uvicorn`)
+- Rust Honeypots (`backend/rust_honeypots`, via `cargo`)
+- Next.js Frontend (`frontend`, via `npm run dev`)
+
+Über optionale Parameter können einzelne Komponenten ausgelassen werden, z. B. `./start_all.sh --skip-supabase --skip-rust`. Beim Beenden des Skripts (z. B. per `Strg+C`) werden alle gestarteten Prozesse kontrolliert gestoppt.
