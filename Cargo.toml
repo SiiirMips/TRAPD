@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "services/api-rs",
+  "services/processor-rs",
+  "services/sensor-rs"
+]
+resolver = "2"
+
+[toolchain]
+channel = "1.81.0"
+components = ["clippy","rustfmt"]
