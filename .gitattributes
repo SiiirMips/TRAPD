@@ -1,4 +1,0 @@
-# .gitattributes
-# Tell Linguist to recognize TypeScript files
-*.ts linguist-language=TypeScript
-*.tsx linguist-language=TypeScript
