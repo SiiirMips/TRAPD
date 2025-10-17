@@ -2,6 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+let ratelimit: Ratelimit | null = null;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  });
+  ratelimit = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(5, "10 m"),
+    analytics: true,
+    prefix: "auth:password-reset",
+  });
+}
 
 const resetSchema = z.object({
   email: z.string().email().toLowerCase().trim(),
@@ -17,6 +33,18 @@ const resetSchema = z.object({
 
 export async function POST(req: NextRequest) {
   try {
+    // Rate limit check
+    const ip = req.headers.get("x-forwarded-for") ?? "unknown";
+    if (ratelimit) {
+      const { success } = await ratelimit.limit(`ip:${ip}`);
+      if (!success) {
+        return NextResponse.json(
+          { error: "Too many password reset attempts. Please try again later." },
+          { status: 429 }
+        );
+      }
+    }
+
     const body = await req.json();
     const { email, token, password } = resetSchema.parse(body);
 
@@ -107,7 +135,6 @@ export async function POST(req: NextRequest) {
     });
 
     // Audit log
-    const ip = req.headers.get("x-forwarded-for") ?? "unknown";
     await prisma.auditLog.create({
       data: {
         event: "PASSWORD_RESET",

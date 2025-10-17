@@ -106,6 +106,17 @@ export default function SignupPage() {
               <p className="mt-3 text-xs text-muted-foreground text-center">
                 Tip: If the address is already verified, no new email is sent. You can try signing in or use "Forgot password".
               </p>
+              <div className="mt-4 flex items-center justify-center">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    // Resend verification implementation if needed
+                  }}
+                  className="text-sm text-muted-foreground underline-offset-4 hover:underline"
+                >
+                  Didn't receive email? Click to resend
+                </button>
+              </div>
             </CardContent>
           </Card>
         </div>

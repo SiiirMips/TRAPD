@@ -82,7 +82,7 @@ model Password {
 
 model Totp {
   userId     String    @id
-  secret     Bytes
+  secret     String
   verified   Boolean   @default(false)
   lastUsedAt DateTime?
   user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
