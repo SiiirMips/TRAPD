@@ -1,6 +1,54 @@
-version: "3.8"
 services:
-  api:
-    build: ./services/api-rs
+  postgres:
+    image: postgres:16-alpine
+    container_name: trapd-postgres
+    restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=trapd
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: trapd-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+    environment:
+      - MP_MAX_MESSAGES=500
+      - MP_SMTP_AUTH_ACCEPT_ANY=1
+      - MP_SMTP_AUTH_ALLOW_INSECURE=1
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: trapd-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # Native TCP
+    environment:
+      - CLICKHOUSE_DB=trapd
+      - CLICKHOUSE_USER=trapd
+      - CLICKHOUSE_PASSWORD=trapd_pwd
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+
+volumes:
+  postgres_data:
+    name: trapd_postgres_data
+  clickhouse_data:
+    name: trapd_clickhouse_data
+  clickhouse_logs:
+    name: trapd_clickhouse_logs

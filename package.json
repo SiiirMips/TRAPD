@@ -1,0 +1,14 @@
+{
+	"dependencies": {
+		"@prisma/client": "^6.17.1",
+		"@simplewebauthn/browser": "^13.2.2",
+		"@simplewebauthn/server": "^13.2.2",
+		"@upstash/ratelimit": "^2.0.6",
+		"@upstash/redis": "^1.35.6",
+		"argon2": "^0.44.0",
+		"next-safe": "^3.5.0",
+		"prisma": "^6.17.1",
+		"react-hook-form": "^7.65.0",
+		"zod": "^4.1.12"
+	}
+}

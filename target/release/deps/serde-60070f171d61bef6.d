@@ -1,0 +1,14 @@
+C:\Users\mbl\OneDrive - brill + adloff GmbH\Desktop\TRAPD\TRAPD\target\release\deps\serde-60070f171d61bef6.d: C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\mbl\OneDrive\ -\ brill\ +\ adloff\ GmbH\Desktop\TRAPD\TRAPD\target\release\build\serde-8946146c5e4fa9e1\out/private.rs
+
+C:\Users\mbl\OneDrive - brill + adloff GmbH\Desktop\TRAPD\TRAPD\target\release\deps\libserde-60070f171d61bef6.rlib: C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\mbl\OneDrive\ -\ brill\ +\ adloff\ GmbH\Desktop\TRAPD\TRAPD\target\release\build\serde-8946146c5e4fa9e1\out/private.rs
+
+C:\Users\mbl\OneDrive - brill + adloff GmbH\Desktop\TRAPD\TRAPD\target\release\deps\libserde-60070f171d61bef6.rmeta: C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\mbl\OneDrive\ -\ brill\ +\ adloff\ GmbH\Desktop\TRAPD\TRAPD\target\release\build\serde-8946146c5e4fa9e1\out/private.rs
+
+C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\mbl\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\mbl\OneDrive\ -\ brill\ +\ adloff\ GmbH\Desktop\TRAPD\TRAPD\target\release\build\serde-8946146c5e4fa9e1\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\mbl\\OneDrive - brill + adloff GmbH\\Desktop\\TRAPD\\TRAPD\\target\\release\\build\\serde-8946146c5e4fa9e1\\out
